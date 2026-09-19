@@ -329,6 +329,11 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
+    if "omlx.gateway.authorized" in request.scope:
+        from .gateway.middleware import AUTHORIZED
+        if request.scope["omlx.gateway.authorized"] is AUTHORIZED:
+            return True
+
     from .admin.auth import fingerprint_key, verify_any_api_key
     from .utils.network import is_loopback_bind
 
@@ -600,7 +605,8 @@ async def lifespan(app: FastAPI):
     # Runs after the enforcer wiring above so the preload sees the final
     # memory ceiling.
     preload_task = None
-    if _server_state.engine_pool is not None:
+    from .scheduling import local_inference_suspended
+    if _server_state.engine_pool is not None and not local_inference_suspended():
         _server_state.pinned_preload_complete = False
 
         async def _preload_pinned() -> None:
@@ -610,6 +616,8 @@ async def lifespan(app: FastAPI):
                 _server_state.pinned_preload_complete = True
 
         preload_task = asyncio.create_task(_preload_pinned())
+    elif local_inference_suspended():
+        _server_state.pinned_preload_complete = True
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -703,6 +711,10 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+
+if os.environ.get("OMLX_GATEWAY_CONFIG"):
+    from .gateway.middleware import GatewayMiddleware
+    app.add_middleware(GatewayMiddleware, config_path=os.environ["OMLX_GATEWAY_CONFIG"])
 
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router
@@ -1329,6 +1341,9 @@ async def get_engine(
     """
     pool = get_engine_pool()
 
+    from .scheduling import request_control
+    controlled_request = request_control.get() is not None
+
     # Default model only applies to LLM
     if model_id is None:
         if engine_type != EngineType.LLM:
@@ -1379,6 +1394,7 @@ async def get_engine(
         # Fallback to default model if enabled (LLM only)
         if (
             engine_type == EngineType.LLM
+            and not controlled_request
             and _server_state.global_settings
             and _server_state.global_settings.model.model_fallback
             and _server_state.default_model
@@ -1430,6 +1446,11 @@ async def get_engine(
     # release it before raising so a rejected request never leaks an in_use
     # count (which would pin the engine non-evictable forever).
     try:
+        if controlled_request and not isinstance(engine, BatchedEngine):
+            raise HTTPException(
+                status_code=503,
+                detail="This engine does not yet support gateway token and context controls",
+            )
         if engine_type == EngineType.EMBEDDING:
             if not isinstance(engine, EmbeddingEngine):
                 raise HTTPException(

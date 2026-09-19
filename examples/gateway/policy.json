@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "allowed_model_aliases": ["local/coder"],
+  "priority": 100,
+  "local_policy": "only",
+  "max_context_tokens": 32768,
+  "max_output_tokens": 4096,
+  "max_concurrency": 2,
+  "max_local_queue_ms": 2000,
+  "logging_policy": "metadata"
+}

@@ -1,0 +1,10 @@
+{
+  "aliases": {
+    "local/coder": {
+      "local_model": "REPLACE_WITH_INSTALLED_MODEL_DIRECTORY",
+      "configuration": "REPLACE_WITH_HARDWARE_MODEL_QUANT_KV_SPEC_REVISION"
+    }
+  },
+  "cloud_enabled": false,
+  "capacity_points": []
+}

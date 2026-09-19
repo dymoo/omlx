@@ -1,0 +1,29 @@
+name: Gateway control plane
+on:
+  pull_request:
+  push:
+    branches: [gateway/control-plane]
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway-test-only
+          POSTGRES_DB: gateway
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gateway"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      GATEWAY_TEST_DSN: postgresql://gateway:gateway-test-only@localhost:5432/gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install fastapi httpx asyncpg pytest pytest-asyncio ruff
+      - run: python -m ruff check omlx/gateway omlx/scheduling.py tests/gateway
+      - run: python -m pytest tests/gateway --confcutdir=tests/gateway -q

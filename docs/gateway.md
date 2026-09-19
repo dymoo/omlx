@@ -281,22 +281,35 @@ python -m pytest tests/gateway --confcutdir=tests/gateway -q
 python -m ruff check omlx/gateway omlx/scheduling.py tests/gateway
 ```
 
-At delivery: **21 passed, 4 skipped**. Skipped tests are real Postgres checks:
-concurrent spend reservations, unknown charges across rollover, COPY/idempotence/
-retention and routing-mode persistence. Run with `GATEWAY_TEST_DSN`; the added CI
-workflow supplies Postgres 16. The workspace could not install/start a usable
-Postgres server, so the real database integration is not claimed validated.
+Initial GitHub Actions validation: **25 passed**, including real Postgres checks
+for concurrent spend reservations, unknown charges across rollover,
+COPY/idempotence/retention and routing-mode persistence. Run with
+`GATEWAY_TEST_DSN`; the gateway CI workflow supplies Postgres 16.
 No full upstream MLX suite ran on this Linux host. Test numerical/inference
 behavior and model release on Apple Silicon before deployment.
 
-The local checkout has `origin=https://github.com/dymoo/omlx.git` and
-`upstream=https://github.com/jundot/omlx.git`. The connected account returned 404
-for the requested fork; no remote repository or PR was created or pushed.
-The delivered patch series applies to the pinned upstream commit.
+The public repository is `dymoo/omlx`. It is a standalone downstream with the
+original upstream history imported, rather than a GitHub-native fork. `master`
+is the published gateway branch; `gateway/control-plane` is the implementation
+branch. The pinned upstream baseline remains in Git history. Configure remotes
+when cloning (Git remotes are local checkout configuration):
+
+```sh
+git clone https://github.com/dymoo/omlx.git
+cd omlx
+git remote add upstream https://github.com/jundot/omlx.git
+```
+
+The source patch series applies to the pinned upstream commit. Only gateway CI
+is enabled in this downstream; inherited upstream CI and release workflows are
+not installed. Review workflow changes explicitly when synchronizing upstream.
+The initialization merge preserves the empty repository's original commit too.
+Rebase an isolated synchronization branch and review it before updating shared
+branches:
 
 ```sh
 git fetch upstream
-git switch gateway/control-plane
+git switch -c sync/upstream gateway/control-plane
 git rebase upstream/main
 ```
 

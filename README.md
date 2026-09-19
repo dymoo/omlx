@@ -1,3 +1,27 @@
+# oMLX Local-First Gateway
+
+This public downstream of [jundot/omlx](https://github.com/jundot/omlx) adds an
+optional inference gateway in the same Python service: API-key policies,
+priority admission, bounded OpenRouter overflow, cost accounting, and batched
+Postgres JSONB logging.
+
+Use **cloud-only mode** to keep the gateway online while local generations drain
+and model memory is released. Switch back to auto for local-first routing.
+
+```sh
+omlx-gateway mode cloud_only --wait
+omlx-gateway mode auto
+```
+
+Start with the [gateway setup and operations guide](docs/gateway.md), which lists
+implemented behavior and remaining gates. This is an initial implementation;
+Apple Silicon inference, exact model compatibility, and hardware release still
+require validation. Gateway-disabled serving retains upstream behavior.
+
+The upstream project documentation follows below.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">

@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+from .scheduling import RequestControl, request_control
+
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
 
@@ -232,6 +234,7 @@ class Request:
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
+    control: Optional[RequestControl] = field(default_factory=request_control.get)
 
     @property
     def num_output_tokens(self) -> int:
@@ -258,10 +261,16 @@ class Request:
             return self.finish_reason
         return RequestStatus.get_finish_reason(self.status)
 
+    def __post_init__(self):
+        if self.control is not None:
+            self.priority = self.control.priority
+
     def append_output_token(self, token_id: int) -> None:
         """Append a generated token to the output."""
         self.output_token_ids.append(token_id)
         self.num_computed_tokens += 1
+        if self.control is not None and self.control.on_token is not None:
+            self.control.on_token(1)
 
     def set_finished(self, status: RequestStatus, reason: Optional[str] = None) -> None:
         """Mark the request as finished."""

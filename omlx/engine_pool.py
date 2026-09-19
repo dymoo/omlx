@@ -1783,12 +1783,17 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        from .scheduling import local_inference_suspended
+        if local_inference_suspended():
+            raise ModelUnavailableError(model_id, "Local inference is suspended")
         ready = self._acquire_loaded_engine(
             model_id, force_lm, _lease, runtime_settings
         )
         if ready is not None:
             return ready
         async with self._lock:
+            if local_inference_suspended():
+                raise ModelUnavailableError(model_id, "Local inference is suspended")
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
@@ -2129,6 +2134,21 @@ class EnginePool:
 
             await self._unload_engine(model_id)
             return True
+
+    async def unload_idle_models(self, *, include_pinned: bool = False) -> dict:
+        """Release idle models without aborting work or modifying pin settings."""
+        async with self._lock:
+            for model_id, entry in self._entries.items():
+                if entry.engine is None or entry.is_loading:
+                    continue
+                if entry.is_pinned and not include_pinned:
+                    continue
+                if self._entry_is_quiescent(entry):
+                    await self._unload_engine(model_id)
+            return {
+                "loaded_models": self.get_loaded_model_ids(),
+                "loading_models": [mid for mid, entry in self._entries.items() if entry.is_loading],
+            }
 
     @asynccontextmanager
     async def acquire(self, model_id: str, force_lm: bool = False):

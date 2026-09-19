@@ -8974,6 +8974,10 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        if request.control is not None and request.control.max_context_tokens is not None:
+            if request.num_prompt_tokens + request.max_tokens > request.control.max_context_tokens:
+                raise ValueError("Gateway context limit exceeded before prefill")
+
         if self.block_aware_cache is not None:
             # Arm MTP boundary alignment now: a prompt shorter than a block meets
             # its first boundary mid-decode, before any capture would arm it.
@@ -9001,6 +9005,8 @@ class Scheduler:
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
+        if request.control is not None:
+            self.waiting = deque(sorted(self.waiting))
 
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"

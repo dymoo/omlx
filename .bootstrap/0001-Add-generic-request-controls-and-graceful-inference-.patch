@@ -1,0 +1,158 @@
+From 9093dece2321539f75c2b4fdbe5e83aa3dffc752 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 19 Sep 2026 13:15:58 +0200
+Subject: [PATCH 1/4] Add generic request controls and graceful inference
+ suspension
+
+---
+ omlx/engine_pool.py | 20 ++++++++++++++++++++
+ omlx/request.py     |  9 +++++++++
+ omlx/scheduler.py   |  6 ++++++
+ omlx/scheduling.py  | 29 +++++++++++++++++++++++++++++
+ 4 files changed, 64 insertions(+)
+ create mode 100644 omlx/scheduling.py
+
+diff --git a/omlx/engine_pool.py b/omlx/engine_pool.py
+index ea9ed5f..209fd2c 100644
+--- a/omlx/engine_pool.py
++++ b/omlx/engine_pool.py
+@@ -1783,12 +1783,17 @@ class EnginePool:
+             InsufficientMemoryError: If can't free enough memory (all pinned)
+             ModelLoadingError: If model is already being loaded
+         """
++        from .scheduling import local_inference_suspended
++        if local_inference_suspended():
++            raise ModelUnavailableError(model_id, "Local inference is suspended")
+         ready = self._acquire_loaded_engine(
+             model_id, force_lm, _lease, runtime_settings
+         )
+         if ready is not None:
+             return ready
+         async with self._lock:
++            if local_inference_suspended():
++                raise ModelUnavailableError(model_id, "Local inference is suspended")
+             entry = self._entries.get(model_id)
+             if not entry:
+                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+@@ -2130,6 +2135,21 @@ class EnginePool:
+             await self._unload_engine(model_id)
+             return True
+ 
++    async def unload_idle_models(self, *, include_pinned: bool = False) -> dict:
++        """Release idle models without aborting work or modifying pin settings."""
++        async with self._lock:
++            for model_id, entry in self._entries.items():
++                if entry.engine is None or entry.is_loading:
++                    continue
++                if entry.is_pinned and not include_pinned:
++                    continue
++                if self._entry_is_quiescent(entry):
++                    await self._unload_engine(model_id)
++            return {
++                "loaded_models": self.get_loaded_model_ids(),
++                "loading_models": [mid for mid, entry in self._entries.items() if entry.is_loading],
++            }
++
+     @asynccontextmanager
+     async def acquire(self, model_id: str, force_lm: bool = False):
+         """Acquire an engine with an atomic in-use lease.
+diff --git a/omlx/request.py b/omlx/request.py
+index b62779c..077dfd1 100644
+--- a/omlx/request.py
++++ b/omlx/request.py
+@@ -12,6 +12,8 @@ import time
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+ 
++from .scheduling import RequestControl, request_control
++
+ if TYPE_CHECKING:
+     from .cache.paged_cache import BlockTable
+ 
+@@ -232,6 +234,7 @@ class Request:
+ 
+     # Request-scoped tool schemas used by protocol output parsers.
+     tools: list[dict[str, Any]] | None = None
++    control: Optional[RequestControl] = field(default_factory=request_control.get)
+ 
+     @property
+     def num_output_tokens(self) -> int:
+@@ -258,10 +261,16 @@ class Request:
+             return self.finish_reason
+         return RequestStatus.get_finish_reason(self.status)
+ 
++    def __post_init__(self):
++        if self.control is not None:
++            self.priority = self.control.priority
++
+     def append_output_token(self, token_id: int) -> None:
+         """Append a generated token to the output."""
+         self.output_token_ids.append(token_id)
+         self.num_computed_tokens += 1
++        if self.control is not None and self.control.on_token is not None:
++            self.control.on_token(1)
+ 
+     def set_finished(self, status: RequestStatus, reason: Optional[str] = None) -> None:
+         """Mark the request as finished."""
+diff --git a/omlx/scheduler.py b/omlx/scheduler.py
+index a7e9418..cc99eac 100644
+--- a/omlx/scheduler.py
++++ b/omlx/scheduler.py
+@@ -8974,6 +8974,10 @@ class Scheduler:
+                 request.prompt_token_ids = list(request.prompt)
+             request.num_prompt_tokens = len(request.prompt_token_ids)
+ 
++        if request.control is not None and request.control.max_context_tokens is not None:
++            if request.num_prompt_tokens + request.max_tokens > request.control.max_context_tokens:
++                raise ValueError("Gateway context limit exceeded before prefill")
++
+         if self.block_aware_cache is not None:
+             # Arm MTP boundary alignment now: a prompt shorter than a block meets
+             # its first boundary mid-decode, before any capture would arm it.
+@@ -9001,6 +9005,8 @@ class Scheduler:
+         # Add to tracking
+         self.requests[request.request_id] = request
+         self.waiting.append(request)
++        if request.control is not None:
++            self.waiting = deque(sorted(self.waiting))
+ 
+         logger.debug(
+             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
+diff --git a/omlx/scheduling.py b/omlx/scheduling.py
+new file mode 100644
+index 0000000..1c53531
+--- /dev/null
++++ b/omlx/scheduling.py
+@@ -0,0 +1,29 @@
++"""Generic per-request control hooks, independent of HTTP and gateway policy."""
++
++from collections.abc import Callable
++from contextvars import ContextVar
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class RequestControl:
++    priority: int = 100
++    weight: int = 1
++    max_context_tokens: int | None = None
++    on_token: Callable[[int], None] | None = None
++
++
++request_control: ContextVar[RequestControl | None] = ContextVar(
++    "omlx_request_control", default=None
++)
++
++_local_inference_suspended = False
++
++
++def set_local_inference_suspended(suspended: bool) -> None:
++    global _local_inference_suspended
++    _local_inference_suspended = suspended
++
++
++def local_inference_suspended() -> bool:
++    return _local_inference_suspended
+-- 
+2.51.1
+

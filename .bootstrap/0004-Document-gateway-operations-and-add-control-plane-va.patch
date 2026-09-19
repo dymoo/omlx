@@ -1,0 +1,1198 @@
+From 170b312fc0e2f8b38b681d7f898eff9da87c8490 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 19 Sep 2026 13:15:58 +0200
+Subject: [PATCH 4/4] Document gateway operations and add control-plane
+ validation
+
+---
+ .github/workflows/gateway.yml       |  29 +++
+ docs/gateway.md                     | 319 +++++++++++++++++++++++++
+ examples/gateway/config.json        |  10 +
+ examples/gateway/policy.json        |  11 +
+ tests/gateway/test_cancellation.py  |  86 +++++++
+ tests/gateway/test_control_plane.py | 351 ++++++++++++++++++++++++++++
+ tests/gateway/test_operations.py    | 195 ++++++++++++++++
+ tests/gateway/test_postgres.py      | 121 ++++++++++
+ 8 files changed, 1122 insertions(+)
+ create mode 100644 .github/workflows/gateway.yml
+ create mode 100644 docs/gateway.md
+ create mode 100644 examples/gateway/config.json
+ create mode 100644 examples/gateway/policy.json
+ create mode 100644 tests/gateway/test_cancellation.py
+ create mode 100644 tests/gateway/test_control_plane.py
+ create mode 100644 tests/gateway/test_operations.py
+ create mode 100644 tests/gateway/test_postgres.py
+
+diff --git a/.github/workflows/gateway.yml b/.github/workflows/gateway.yml
+new file mode 100644
+index 0000000..410f752
+--- /dev/null
++++ b/.github/workflows/gateway.yml
+@@ -0,0 +1,29 @@
++name: Gateway control plane
++on:
++  pull_request:
++  push:
++    branches: [gateway/control-plane]
++jobs:
++  gateway:
++    runs-on: ubuntu-latest
++    services:
++      postgres:
++        image: postgres:16
++        env:
++          POSTGRES_USER: gateway
++          POSTGRES_PASSWORD: gateway-test-only
++          POSTGRES_DB: gateway
++        ports: ['5432:5432']
++        options: >-
++          --health-cmd "pg_isready -U gateway"
++          --health-interval 5s --health-timeout 5s --health-retries 10
++    env:
++      GATEWAY_TEST_DSN: postgresql://gateway:gateway-test-only@localhost:5432/gateway
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.12'
++      - run: pip install fastapi httpx asyncpg pytest pytest-asyncio ruff
++      - run: python -m ruff check omlx/gateway omlx/scheduling.py tests/gateway
++      - run: python -m pytest tests/gateway --confcutdir=tests/gateway -q
+diff --git a/docs/gateway.md b/docs/gateway.md
+new file mode 100644
+index 0000000..868397e
+--- /dev/null
++++ b/docs/gateway.md
+@@ -0,0 +1,319 @@
++# Local-first inference gateway: implementation and operations
++
++Status: initial implementation, not production validated. Based on upstream
++`jundot/omlx` commit `14194fe74bab38b89c144bd89656fbedca641d14`
++(`0.7.0.dev4`). No Apple hardware benchmarks or real cloud requests were run.
++
++## What is implemented
++
++The optional gateway wraps the existing ASGI application in the same Python
++process. Local requests call the original application directly; there is no
++loopback HTTP server or separate TypeScript service. Gateway-disabled behavior
++is preserved. Enable it with `OMLX_GATEWAY_CONFIG`.
++
++- HMAC-SHA256 hashes of cryptographically random 256-bit API keys. The separate
++  pepper is required; plaintext keys are printed once by the creation command.
++- Postgres policies reloaded on every authenticated request, versioned changes,
++  revocation, exact alias allowlists, context/output ceilings and concurrency.
++- Atomic daily token reservations and per-key/global daily/monthly cloud spend
++  reservations. UTC calendar windows. Outstanding unknown costs survive rollover.
++- Priority admission (lower number means higher priority), bounded queue and
++  queue deadlines; conservative empirical aggregate-throughput estimates protect
++  configured decode floors. Unknown capacity is not advertised as guaranteed TPS.
++- Generic runtime token callbacks; instantaneous, 1/5/15-second and lifetime TPS.
++  Stable decode cohorts update bucketed EWMA capacity estimates in Postgres.
++- OpenRouter provider allowlists/order, model pinning, streaming, timeout,
++  cancellation, circuit breaker, usage and provider-reported charge accounting.
++- Persistent cloud-only mode, queue wakeup, graceful local draining and idle
++  model unload, including pinned models without changing their pin preferences.
++- Optional `usage.x_gateway` accounting. Standard token fields are retained.
++- Batched Postgres JSONB request/response logs; optional S3 adapter remains.
++- Local administration CLI, example configurations and Linux control-plane CI.
++
++Product names and subscription tiers do not appear in policy logic.
++
++## What is not implemented or validated
++
++This is **not the complete performance appliance from the design brief**.
++The following remain explicit implementation/benchmark gates:
++
++- Weighted *decode* allocation. `scheduling_weight` is carried as generic
++  metadata but does not change per-step GPU service. Current active batches
++  share decode opportunities; priorities affect admission and waiting order.
++- Cache-affinity routing, tenant cache namespaces, per-key retention/stickiness,
++  cache-priority eviction, multiple local nodes and predicted cache-hit admission.
++  Upstream prefix/RAM/SSD caching remains available, but it has no gateway-tier
++  policy in this patch. Do not promise tenant-isolated prefix caching yet.
++- Direct bandwidth/GPU counters, hard instantaneous TPS guarantees, predictive
++  prefill interference modelling and automatic calibration of unseen concurrency.
++- Exact GLM-5.3-Flash mixed 4/8 quant compatibility and quality, compressed KV,
++  native MTP and DFlash/DFlash2 combinations on the target hardware.
++- Speculation acceptance telemetry adapters and model-specific cloud tokenizers.
++- Streaming Responses state retrieval, multimodal billing, embeddings, rerank,
++  audio and Anthropic endpoints under gateway policy. When the gateway is on,
++  unsupported `/v1` endpoints fail closed; when off, upstream endpoints remain.
++- Durable trace spool, JSONB partition rotation, automatic provider-charge
++  reconciliation and fully allocated idle-time hardware costs.
++
++Gateway local routing currently accepts only upstream `BatchedEngine`. DFlash
++and other engine paths are rejected until they implement the same exact
++context/token control hooks. This prevents silently bypassing policy enforcement.
++
++## Install and bootstrap on the Mac
++
++Install the fork using upstream's supported macOS/Python prerequisites:
++
++```sh
++pip install -e '.[gateway]'
++export OMLX_GATEWAY_POSTGRES_DSN='postgresql://USER:PASSWORD@HOST/omlx'
++# Supply a persistent random secret of at least 32 bytes from your secret store.
++export OMLX_GATEWAY_PEPPER='REPLACE_WITH_PERSISTENT_RANDOM_SECRET'
++omlx-gateway migrate
++omlx-gateway hardware
++```
++
++Use a dedicated database and ordinary logged tables. The serving process takes
++a database advisory lock: run **one serving worker**, not multiple Uvicorn workers.
++Metadata admission fails closed if the database is unavailable. Postgres provides
++shared, durable state; SQLite would be sufficient for a strictly single-machine
++deployment, but this implementation uses the requested Postgres backend.
++
++Copy and edit `examples/gateway/config.json`, replacing the physical model and
++configuration fingerprint with the installed model and actual hardware/runtime
++settings. No model sizes, memory bandwidths, model slugs or token prices are
++invented by the code. The fingerprint must change when model revision, weights,
++KV precision, speculative settings, runtime revision or hardware changes.
++
++```sh
++omlx-gateway policy internal examples/gateway/policy.json
++omlx-gateway key --policy internal
++export OMLX_GATEWAY_CONFIG='/absolute/path/to/config.json'
++omlx serve --model-dir ~/models
++```
++
++The initial example is local-only and best effort. With no measured capacity
++points, it admits a single best-effort request; requests demanding an unmeasured
++floor queue/reject. Calibrate before enabling paid floors or concurrency. A
++singleton can produce observations but cannot safely infer higher concurrency.
++
++Keep upstream's owner/admin authentication configured for a non-loopback bind.
++Gateway keys authorize the listed inference routes, not administrative routes.
++Use `OPENAI_BASE_URL=http://localhost:8000/v1` and the generated gateway key.
++
++## Release the hardware while keeping the API online
++
++Configure each cloud-capable alias with a verified OpenRouter model slug,
++provider allowlist, optional provider order, fallback flag, and a versioned price
++ceiling covering **every** eligible provider. Enable the applicable per-key and
++global daily/monthly budgets, per-request limit and `cloud_enabled` configuration.
++Set `OPENROUTER_API_KEY` in the service environment. The initial database cloud
++switch is off even if configuration says cloud is enabled.
++
++```sh
++omlx-gateway cloud on
++omlx-gateway mode cloud_only --wait
++omlx-gateway status
++# Return to local-first operation; models load on demand.
++omlx-gateway mode auto
++```
++
++`cloud_only` is persisted in Postgres and honored on restart before pinned model
++preloading. Each new dispatch reads it; queued requests are awakened by the
++control loop, normally within one second. The mode does not require a restart.
++
++1. New cloud-eligible requests go directly to OpenRouter.
++2. Queued local requests take their permitted cloud route or reject.
++3. Active local requests drain; generated streams are never migrated/replayed.
++4. The pool stops accepting new local acquisitions, including admin-initiated
++   inference. Idle engines are unloaded, respecting active leases and loading.
++5. `--wait` returns only after a fresh runtime heartbeat reports no active local
++   tickets, no loaded models and no loading models. It can time out while a long
++   generation or load drains; it never force-aborts those requests.
++
++Local-only keys reject in this mode. A prefer-local key needs `cloud_fallback=true`.
++Provider restrictions, quotas and budgets remain in force. A cloud outage or
++exhausted budget returns an error; it does not quietly start using local hardware.
++The API remains dependent on this Mac, its network and Postgres being up. This
++mode frees inference resources; it is not availability failover for the gateway
++host itself.
++
++`omlx-gateway cloud off` is a separate emergency spending switch. It prevents
++new cloud reservations and does not recall already-dispatched provider work.
++
++## JSONB logging: inexpensive bulk ingestion
++
++Default: `trace_backend="postgres"`. Each full-log request produces one trace
++row with `request_id`, timestamps, expiry and a JSONB payload. The large payload
++table is separate from the small authoritative spend ledger. Metadata-only keys
++never log prompt/response bodies; `none` keeps only mandatory accounting state.
++
++The writer buffers up to 100 rows, approximately 4 MiB, or one second, whichever
++threshold is reached. It uses asyncpg binary COPY into a transaction-local staging
++table, followed by one idempotent insert into `gateway_traces`. Retrying a batch
++cannot duplicate request IDs. No per-token SQL writes. SSE is stored as one
++bounded response string inside the document, not one database row per event.
++
++The queue has both row and byte ceilings (1000 / 32 MiB). Three failed batch
++attempts or a full queue drop diagnostic logs with counters; inference does not
++block on trace ingestion. A crash can lose buffered diagnostic logs. Financial
++reservations and settlements are synchronous separate transactions and never
++depend on the best-effort queue. `trace_status=queued` is not proof of durability;
++query the trace table for persisted records. Runtime status exposes queue bytes,
++written rows and dropped rows. Graceful shutdown drains the writer with a timeout.
++
++Default full-log limits are 1 MiB for input and 1 MiB for output. Oversized input
++is omitted with its size recorded; output is truncated and flagged. Full trace
++content can contain user secrets from prompts; auth headers and the provider API
++key are never included. NUL and unpaired surrogate characters are normalized in
++diagnostic logs because Postgres JSONB rejects them.
++
++Only request-ID, expiry and BRIN time indexes are created. Avoid a blanket GIN
++index over every prompt. Add a narrow expression index only for an actual query.
++Run bounded retention deletion periodically from the deployment's scheduler:
++
++```sh
++omlx-gateway prune-traces --batch-size 1000
++```
++
++At sustained large log volume, migrate to time partitions and drop expired
++partitions; this patch does not create partitions automatically. Repeated huge
++agent prefixes are the main storage risk. Retention/sampling/deduplication will
++matter more than reducing the already-small per-batch SQL overhead. Postgres
++compresses large values via its normal TOAST behavior; choose compression based
++on the installed server build. Do not disable WAL or durability on budget tables.
++
++S3 remains optional with `trace_backend="s3"`, `OMLX_GATEWAY_TRACE_BUCKET` and
++optional `OMLX_GATEWAY_S3_ENDPOINT`. It requires retention lifecycle rules;
++the object's Expires metadata is **not** an automatic deletion mechanism.
++
++## Capacity and accounting semantics
++
++Smaller priority numbers win. New lower-priority work is not admitted when the
++empirical per-stream prediction falls below any active protected floor. Without
++weighted decode scheduling, the predictor conservatively uses aggregate/N.
++Targets are descriptive, floors constrain admission; neither is a hard realtime
++guarantee. A long incumbent can delay a newly arrived high-priority request.
++Use short output limits, queue deadlines and overflow policy to limit that case.
++
++The first predictor uses configuration, power-of-two context envelope bucket and
++concurrency. It does not pretend to know cached-prefix tokens before upstream
++cache lookup. A conservative JSON byte envelope rejects oversized requests early;
++the local scheduler checks actual tokenized prompt + output allowance before
++prefill. Cloud reservation uses the full policy context ceiling plus output
++ceiling, without assuming provider cache hits. Exact cloud template/tokenizer
++integration is a remaining production validation gate.
++
++Stable cohorts must all have emitted tokens and remain unchanged for five
++seconds before updating the capacity EWMA. Mixed models/configurations on one
++GPU are not treated as independent capacity pools. No DRAM bandwidth reading is
++fabricated: runtime reports null with source `unavailable`.
++
++Requests reserve their total context token quota conservatively at admission.
++Final usage reconciles it. Missing usage retains the reservation. Cloud requests
++reserve a ceiling before dispatch; uncertain charges retain the hold even across
++UTC day/month boundaries. There are no automatic post-dispatch retries because
++a network failure does not prove a request was unexecuted or uncharged.
++
++The ledger distinguishes:
++
++- `cash_cogs`: provider-reported charge for cloud; explicitly estimated incremental
++  energy for local. Unknown means null, not zero.
++- `local_estimated_cogs`: estimated energy plus configured amortization per busy
++  hour. Concurrent active requests split time so machine cost is not multiplied
++  by concurrency. Idle amortization and overhead are not allocated yet.
++- `counterfactual_cloud_cogs`: price-versioned comparison using uncached input.
++  Local prefix hits do not imply cloud cache discounts.
++- `subsidy`: counterfactual cloud cost minus local economic estimate, signed.
++  This is an avoided-cost estimate, **not** cash received, profit, a cloud credit
++  or customer subsidy net of revenue. Negative savings remain negative.
++
++Reconcile uncertain charges from actual provider evidence, never by timeout:
++
++```sh
++omlx-gateway reconcile REQUEST_ID --cost ACTUAL_USD --tokens ACTUAL_TOTAL
++```
++
++A provider charge above its reservation is recorded and trips the global cloud
++switch. Spend protection cannot make an incorrect provider price ceiling correct;
++set an OpenRouter-side spending cap as a second bound before public traffic.
++Operator reconciliation is trusted and must use actual evidence. Crashed running
++requests retain holds/concurrency until reconciled rather than silently freeing
++potentially spent budgets.
++
++For usage details, send `"x_gateway":{"include_usage":true}`. Streaming Chat
++Completions standard usage remains opt-in through `stream_options.include_usage`;
++detailed gateway usage also requests it. Responses usage stays in its native
++terminal event. There are no fabricated draft acceptance or bandwidth metrics.
++
++## Exact-model investigation and benchmark gate
++
++Inspected upstream source already includes continuous batching, RAM/SSD prefix
++cache, native MTP patches and TurboQuant. Its DFlash report describes a distinct
++engine path and lists supported target/drafter pairs; GLM-5.3-Flash is not listed.
++The GLM MTP module is explicitly documented as GLM-5.2. TurboQuant includes
++capability exclusions including MLA and attention sinks. These facts do not
++establish support for the desired GLM-5.3 quant or the complete feature stack.
++
++Before declaring a production configuration supported:
++
++1. Pin model repository/revision, tokenizer, quant manifest, runtime dependencies
++   and actual Mac identity/memory. Verify that it fits with OS/KV/draft headroom.
++2. Establish plain batched decode correctness, tool-call behavior and long-context
++   coding quality. Test compressed KV against that baseline.
++3. Verify native MTP head/checkpoint compatibility. Treat DFlash/DFlash2 as a
++   separate target+drafter capability investigation, not a drop-in checkbox.
++4. Benchmark real coding/tool-agent prompts, cold/warm prefix distributions and
++   short/long contexts at measured C1/C2/C4/C8/etc. Record TTFT, per-stream percentiles,
++   aggregate TPS, memory, errors, acceptance and actual runtime configuration.
++5. Test a long cold prefill alongside protected decode, cancellation, SSD restore,
++   memory pressure and cloud-only drain/unload on the Mac.
++6. Benchmark any weighted decode prototype against equal batching before enabling
++   it. Do not trade away substantial aggregate throughput without measured benefit.
++7. Add tenant-safe cache affinity/policy hooks only after inspecting cache identity
++   and refcount/lifecycle behavior. Never claim private namespaces from labels alone.
++
++## Validation and upstream synchronization
++
++Linux tests:
++
++```sh
++python -m pytest tests/gateway --confcutdir=tests/gateway -q
++python -m ruff check omlx/gateway omlx/scheduling.py tests/gateway
++```
++
++At delivery: **21 passed, 4 skipped**. Skipped tests are real Postgres checks:
++concurrent spend reservations, unknown charges across rollover, COPY/idempotence/
++retention and routing-mode persistence. Run with `GATEWAY_TEST_DSN`; the added CI
++workflow supplies Postgres 16. The workspace could not install/start a usable
++Postgres server, so the real database integration is not claimed validated.
++No full upstream MLX suite ran on this Linux host. Test numerical/inference
++behavior and model release on Apple Silicon before deployment.
++
++The local checkout has `origin=https://github.com/dymoo/omlx.git` and
++`upstream=https://github.com/jundot/omlx.git`. The connected account returned 404
++for the requested fork; no remote repository or PR was created or pushed.
++The delivered patch series applies to the pinned upstream commit.
++
++```sh
++git fetch upstream
++git switch gateway/control-plane
++git rebase upstream/main
++```
++
++If starting from a shallow clone, fetch sufficient history before rebasing.
++Likely conflict hotspots: `server.py` middleware/auth/engine selection/lifespan,
++`request.py` token hooks, `scheduler.py` token limits and waiting queue,
++`engine_pool.py` acquisition suspension and graceful idle unload, and packaging
++extras. All policy/storage/provider code lives under `omlx/gateway/`. The generic
++request-control and idle-unload hooks are candidates for separate upstream PRs.
++Never force-push a shared branch just to hide a rebase conflict.
++
++## Primary references
++
++- [oMLX upstream at the inspected revision](https://github.com/jundot/omlx/tree/14194fe74bab38b89c144bd89656fbedca641d14)
++- [Upstream DFlash integration report](https://github.com/jundot/omlx/blob/14194fe74bab38b89c144bd89656fbedca641d14/docs/experimental/dflash_mlx_integration.md)
++- [OpenRouter streaming and cancellation](https://openrouter.ai/docs/api_reference/streaming)
++- [OpenRouter provider routing](https://openrouter.ai/docs/guides/routing/provider-selection)
++- [Postgres COPY guidance](https://www.postgresql.org/docs/current/populate.html)
++- [Postgres JSONB](https://www.postgresql.org/docs/current/datatype-json.html)
++- [asyncpg API](https://magicstack.github.io/asyncpg/current/api/index.html)
+diff --git a/examples/gateway/config.json b/examples/gateway/config.json
+new file mode 100644
+index 0000000..b558be8
+--- /dev/null
++++ b/examples/gateway/config.json
+@@ -0,0 +1,10 @@
++{
++  "aliases": {
++    "local/coder": {
++      "local_model": "REPLACE_WITH_INSTALLED_MODEL_DIRECTORY",
++      "configuration": "REPLACE_WITH_HARDWARE_MODEL_QUANT_KV_SPEC_REVISION"
++    }
++  },
++  "cloud_enabled": false,
++  "capacity_points": []
++}
+diff --git a/examples/gateway/policy.json b/examples/gateway/policy.json
+new file mode 100644
+index 0000000..864d2e9
+--- /dev/null
++++ b/examples/gateway/policy.json
+@@ -0,0 +1,11 @@
++{
++  "enabled": true,
++  "allowed_model_aliases": ["local/coder"],
++  "priority": 100,
++  "local_policy": "only",
++  "max_context_tokens": 32768,
++  "max_output_tokens": 4096,
++  "max_concurrency": 2,
++  "max_local_queue_ms": 2000,
++  "logging_policy": "metadata"
++}
+diff --git a/tests/gateway/test_cancellation.py b/tests/gateway/test_cancellation.py
+new file mode 100644
+index 0000000..e7b1e1a
+--- /dev/null
++++ b/tests/gateway/test_cancellation.py
+@@ -0,0 +1,86 @@
++import asyncio
++import json
++
++from test_control_plane import policy, setup_gateway
++from test_operations import cloud_alias
++
++from omlx.gateway.middleware import GatewayMiddleware
++from omlx.gateway.policy import GatewayConfig
++from omlx.gateway.providers.openrouter import OpenRouter
++
++
++async def test_disconnect_cancels_local_and_releases_admission():
++    started = asyncio.Event()
++    stopped = asyncio.Event()
++
++    async def local(scope, receive, send):
++        await receive()
++        started.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            stopped.set()
++
++    client, runtime, store = setup_gateway(app=local)
++    key = client.headers["authorization"]
++    await client.aclose()
++    gateway = GatewayMiddleware(local, runtime=runtime)
++    received_body = False
++
++    async def receive():
++        nonlocal received_body
++        if not received_body:
++            received_body = True
++            return {
++                "type": "http.request",
++                "body": json.dumps({"model": "coder", "messages": []}).encode(),
++            }
++        await started.wait()
++        return {"type": "http.disconnect"}
++
++    async def send(message):
++        pass
++
++    async with asyncio.timeout(1):
++        await gateway(
++            {
++                "type": "http",
++                "path": "/v1/chat/completions",
++                "method": "POST",
++                "headers": [(b"authorization", key.encode())],
++            },
++            receive,
++            send,
++        )
++    assert stopped.is_set() and not runtime.admission.active
++    assert next(iter(store.records.values()))["status"] == "cancelled"
++
++
++async def test_cloud_transport_failure_keeps_unknown_cost_and_never_retries():
++    import httpx
++
++    calls = []
++
++    async def handler(request):
++        calls.append(request)
++        raise httpx.ReadTimeout("connection lost after dispatch")
++
++    cloud = OpenRouter(
++        "secret",
++        httpx.AsyncClient(
++            transport=httpx.MockTransport(handler), base_url="https://cloud/"
++        ),
++    )
++    client, _, store = setup_gateway(
++        policy(local_policy="never", max_cloud_cost_usd=1),
++        GatewayConfig(aliases={"coder": cloud_alias()}, cloud_enabled=True),
++        cloud,
++    )
++    async with client:
++        response = await client.post(
++            "/v1/chat/completions", json={"model": "coder", "messages": []}
++        )
++    assert response.status_code == 503 and len(calls) == 1
++    record = next(iter(store.records.values()))
++    assert record["status"] == "failed" and record["cost"] is None
++    await cloud.close()
+diff --git a/tests/gateway/test_control_plane.py b/tests/gateway/test_control_plane.py
+new file mode 100644
+index 0000000..e24f009
+--- /dev/null
++++ b/tests/gateway/test_control_plane.py
+@@ -0,0 +1,351 @@
++import asyncio
++import json
++from decimal import Decimal
++
++import httpx
++import pytest
++
++from omlx.gateway.admission import Admission, AdmissionDeniedError, Ticket
++from omlx.gateway.auth import create_key, digest_key
++from omlx.gateway.capacity import CapacityModel
++from omlx.gateway.middleware import AUTHORIZED, GatewayMiddleware, Runtime
++from omlx.gateway.policy import Alias, CapacityPoint, GatewayConfig, KeyPolicy, Price
++from omlx.gateway.pricing import costs, token_cost
++from omlx.gateway.providers.openrouter import OpenRouter
++from omlx.gateway.storage.postgres import LimitExceededError
++from omlx.gateway.telemetry import StreamMetrics
++from omlx.gateway.usage import UsageObserver
++from omlx.request import Request, SamplingParams
++from omlx.scheduling import RequestControl, request_control
++
++
++def policy(**changes):
++    return KeyPolicy(allowed_model_aliases=("coder",), **changes)
++
++
++def test_key_entropy_and_hash():
++    first, digest = create_key(b"a" * 32)
++    second, _ = create_key(b"a" * 32)
++    assert first != second and first not in digest
++    assert digest == digest_key(first, b"a" * 32)
++    assert digest != digest_key(first, b"b" * 32)
++
++
++def test_runtime_context_and_tokens():
++    counts = []
++    token = request_control.set(RequestControl(priority=2, on_token=counts.append))
++    try:
++        request = Request("one", "hello", SamplingParams())
++    finally:
++        request_control.reset(token)
++    request.append_output_token(5)
++    assert request.priority == 2 and counts == [1]
++    assert Request("two", "hello", SamplingParams()).control is None
++
++
++def test_rolling_metrics_decay_when_stalled():
++    now = [0.0]
++    metrics = StreamMetrics(lambda: now[0])
++    for i in range(100):
++        now[0] = i / 10
++        metrics.observe()
++    assert metrics.snapshot()["rolling_5s_tps"] == pytest.approx(10)
++    now[0] = 30
++    assert metrics.snapshot()["rolling_5s_tps"] == 0
++    assert metrics.snapshot()["tokens"] == 100
++
++
++async def test_admission_protects_floor_and_cleans_cancelled_queue():
++    model = CapacityModel(
++        (
++            CapacityPoint(
++                configuration="a", context_bucket=1024, concurrency=1, aggregate_tps=50
++            ),
++            CapacityPoint(
++                configuration="a", context_bucket=1024, concurrency=2, aggregate_tps=60
++            ),
++        ),
++        margin=0,
++    )
++    admission = Admission(model)
++    high = Ticket("high", "k", policy(priority=0, min_tps=40), "a", 1024)
++    low = Ticket("low", "l", policy(priority=10, max_local_queue_ms=10000), "a", 1024)
++    await admission.acquire(high)
++    queued = asyncio.create_task(admission.acquire(low))
++    await asyncio.sleep(0)
++    assert "low" in admission.waiting and "low" not in admission.active
++    queued.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await queued
++    assert not admission.waiting
++    await admission.release(high)
++    await admission.acquire(low)
++    assert "low" in admission.active
++
++
++async def test_uncalibrated_floor_is_not_promised():
++    admission = Admission(CapacityModel())
++    with pytest.raises(AdmissionDeniedError):
++        await admission.acquire(
++            Ticket("one", "key", policy(min_tps=30, below_floor="reject"), "a", 1024)
++        )
++
++
++def test_sse_split_crlf_multiline_and_usage():
++    observer = UsageObserver("coder", lambda usage: {"route": "cloud"})
++    stream = b': ping\r\n\r\ndata: {"id":"gen-1",\r\ndata: "model":"physical","usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.01}}\r\n\r\ndata: [DONE]\r\n\r\n'
++    output = b"".join(observer.feed(stream[i : i + 1]) for i in range(len(stream)))
++    assert b'"model":"coder"' in output
++    assert b'"x_gateway":{"route":"cloud"}' in output
++    assert observer.total_tokens() == 5 and observer.completed
++    assert observer.provider_id == "gen-1"
++
++
++def test_usage_without_extension_and_truncation():
++    observer = UsageObserver("coder")
++    output = observer.feed(b'data: {"usage":{"prompt_tokens":1}}\n\n')
++    assert b"x_gateway" not in output
++    observer.feed(b'data: {"unfinished"', final=True)
++    assert observer.failed and not observer.completed
++
++
++def test_price_and_negative_savings_and_unknown_cloud_cost():
++    price = Price(
++        version="test",
++        input_per_million=1,
++        cached_input_per_million=0.1,
++        output_per_million=2,
++    )
++    assert token_cost(price, 1000, 100, 500) == Decimal("0.00075")
++    alias = Alias(local_model="m", configuration="a", price=price)
++    config = GatewayConfig(
++        aliases={"coder": alias},
++        incremental_watts=100,
++        electricity_usd_per_kwh=1,
++        amortization_usd_per_busy_hour=1,
++    )
++    result = costs(
++        config, alias, {"prompt_tokens": 1, "completion_tokens": 1}, "local", 3600
++    )
++    assert result["subsidy"] < 0  # Never clamp unfavorable economics away.
++    assert costs(config, alias, {}, "cloud", 0)["cash_cogs"] is None
++
++
++class Store:
++    def __init__(self, pol, digest):
++        self.policy = pol
++        self.digest = digest
++        self.records = {}
++        self.cloud_calls = 0
++        self.mode = "auto"
++
++    async def routing_mode(self):
++        return self.mode
++
++    async def identity(self, digest):
++        return (
++            ("key", 1, self.policy)
++            if digest == self.digest and self.policy.enabled
++            else None
++        )
++
++    async def begin(self, request_id, key_id, version, policy):
++        if (
++            sum(r["status"] == "running" for r in self.records.values())
++            >= policy.max_concurrency
++        ):
++            raise LimitExceededError("key_concurrency")
++        self.records[request_id] = {"status": "running"}
++
++    async def reserve_cloud(self, *args):
++        self.cloud_calls += 1
++        if args[-1] > self.policy.max_cloud_cost_usd:
++            raise LimitExceededError("request_cloud_budget")
++
++    async def finish(self, request_id, status, tokens, cost, metadata, trace_key=None):
++        self.records[request_id] = dict(
++            status=status, tokens=tokens, cost=cost, metadata=metadata
++        )
++
++
++async def local_app(scope, receive, send):
++    assert scope["omlx.gateway.authorized"] is AUTHORIZED
++    data = json.loads((await receive())["body"])
++    assert data["model"] == "physical"
++    req = Request("engine", "hello", SamplingParams())
++    req.append_output_token(1)
++    if data.get("stream"):
++        await send(
++            {
++                "type": "http.response.start",
++                "status": 200,
++                "headers": [(b"content-type", b"text/event-stream")],
++            }
++        )
++        await send(
++            {
++                "type": "http.response.body",
++                "body": b'data: {"model":"physical","choices":[{"delta":{"content":"ok"}}]}\n\n',
++                "more_body": True,
++            }
++        )
++        await send(
++            {
++                "type": "http.response.body",
++                "body": b'data: {"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\ndata: [DONE]\n\n',
++                "more_body": False,
++            }
++        )
++    else:
++        await send(
++            {
++                "type": "http.response.start",
++                "status": 200,
++                "headers": [(b"content-type", b"application/json")],
++            }
++        )
++        await send(
++            {
++                "type": "http.response.body",
++                "body": b'{"model":"physical","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}',
++            }
++        )
++
++
++def setup_gateway(pol=None, config=None, cloud=None, app=local_app):
++    plaintext, digest = create_key(b"p" * 32)
++    store = Store(pol or policy(), digest)
++    config = config or GatewayConfig(
++        aliases={"coder": Alias(local_model="physical", configuration="test")}
++    )
++    runtime = Runtime(config, store, b"p" * 32, cloud=cloud)
++    gateway = GatewayMiddleware(app, runtime=runtime)
++    client = httpx.AsyncClient(
++        transport=httpx.ASGITransport(app=gateway),
++        base_url="http://test",
++        headers={"Authorization": f"Bearer {plaintext}"},
++    )
++    return client, runtime, store
++
++
++@pytest.mark.parametrize("stream", [False, True])
++async def test_in_process_auth_alias_usage_and_cleanup(stream):
++    client, runtime, store = setup_gateway()
++    async with client:
++        response = await client.post(
++            "/v1/chat/completions",
++            json={
++                "model": "coder",
++                "messages": [],
++                "stream": stream,
++                "x_gateway": {"include_usage": True},
++            },
++        )
++        assert response.status_code == 200
++        assert '"route":"local"' in response.text and '"model":"coder"' in response.text
++        assert not runtime.admission.active
++        record = next(iter(store.records.values()))
++        assert record["status"] == "complete" and record["tokens"] == 3
++        assert record["metadata"]["telemetry"]["tokens"] == 1
++
++
++async def test_dynamic_policy_revoke_and_client_cannot_override_routing():
++    client, _, store = setup_gateway()
++    async with client:
++        response = await client.post(
++            "/v1/chat/completions",
++            json={"model": "coder", "messages": [], "provider": {"only": ["evil"]}},
++        )
++        assert response.status_code == 400 and not store.records
++        store.policy = policy(enabled=False)
++        assert (await client.get("/v1/models")).status_code == 401
++
++
++async def test_cloud_budget_failure_never_dispatches():
++    called = []
++
++    async def handler(request):
++        called.append(request)
++        return httpx.Response(200, json={})
++
++    cloud = OpenRouter(
++        "secret",
++        httpx.AsyncClient(
++            transport=httpx.MockTransport(handler), base_url="https://cloud/"
++        ),
++    )
++    alias = Alias(
++        local_model="physical",
++        configuration="test",
++        cloud_model="provider/model",
++        provider_only=("provider",),
++        cloud_price_is_ceiling=True,
++        price=Price(
++            version="v1",
++            input_per_million=1,
++            cached_input_per_million=1,
++            output_per_million=1,
++        ),
++    )
++    client, _, store = setup_gateway(
++        policy(local_policy="never"),
++        GatewayConfig(aliases={"coder": alias}, cloud_enabled=True),
++        cloud,
++    )
++    async with client:
++        response = await client.post(
++            "/v1/chat/completions", json={"model": "coder", "messages": []}
++        )
++    assert response.status_code == 429 and not called
++    assert next(iter(store.records.values()))["status"] == "failed"
++    await cloud.close()
++
++
++async def test_openrouter_pinning_and_real_cost():
++    calls = []
++
++    async def handler(request):
++        calls.append(json.loads(request.content))
++        return httpx.Response(
++            200,
++            json={
++                "id": "gen-test",
++                "model": "physical",
++                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "cost": 0.003},
++            },
++        )
++
++    cloud = OpenRouter(
++        "secret",
++        httpx.AsyncClient(
++            transport=httpx.MockTransport(handler), base_url="https://cloud/"
++        ),
++    )
++    alias = Alias(
++        local_model="physical",
++        configuration="test",
++        cloud_model="provider/model",
++        provider_only=("safe",),
++        cloud_price_is_ceiling=True,
++        price=Price(
++            version="v1",
++            input_per_million=1,
++            cached_input_per_million=1,
++            output_per_million=1,
++        ),
++    )
++    client, _, store = setup_gateway(
++        policy(local_policy="never", max_cloud_cost_usd=1),
++        GatewayConfig(aliases={"coder": alias}, cloud_enabled=True),
++        cloud,
++    )
++    async with client:
++        response = await client.post(
++            "/v1/chat/completions", json={"model": "coder", "messages": []}
++        )
++    assert response.status_code == 200
++    assert calls[0]["model"] == "provider/model" and calls[0]["provider"]["only"] == [
++        "safe"
++    ]
++    assert next(iter(store.records.values()))["cost"] == Decimal("0.003")
++    await cloud.close()
+diff --git a/tests/gateway/test_operations.py b/tests/gateway/test_operations.py
+new file mode 100644
+index 0000000..f3bb925
+--- /dev/null
++++ b/tests/gateway/test_operations.py
+@@ -0,0 +1,195 @@
++import ast
++import asyncio
++from pathlib import Path
++from types import SimpleNamespace
++
++import httpx
++import pytest
++from test_control_plane import policy, setup_gateway
++
++from omlx.gateway.admission import Admission, AdmissionDeniedError, Ticket
++from omlx.gateway.capacity import CapacityModel
++from omlx.gateway.policy import Alias, GatewayConfig, Price
++from omlx.gateway.providers.openrouter import OpenRouter
++from omlx.gateway.storage.trace_writer import TraceWriter
++from omlx.scheduling import set_local_inference_suspended
++
++
++@pytest.fixture(autouse=True)
++def reset_suspension():
++    set_local_inference_suspended(False)
++    yield
++    set_local_inference_suspended(False)
++
++
++async def test_cloud_only_wakes_queue_without_cancelling_active_generation():
++    admission = Admission(CapacityModel())
++    active = Ticket("active", "k", policy(), "c", 1024)
++    queued = Ticket("queued", "k", policy(max_local_queue_ms=10000), "c", 1024)
++    await admission.acquire(active)
++    waiter = asyncio.create_task(admission.acquire(queued))
++    await asyncio.sleep(0)
++    await admission.set_mode("cloud_only")
++    with pytest.raises(AdmissionDeniedError) as error:
++        await waiter
++    assert error.value.action == "cloud"
++    assert list(admission.active) == ["active"]
++    assert not admission.waiting
++    await admission.release(active)
++    await admission.set_mode("auto")
++    await admission.acquire(queued)
++
++
++def cloud_alias():
++    return Alias(
++        local_model="physical",
++        configuration="test",
++        cloud_model="provider/model",
++        provider_only=("safe",),
++        cloud_price_is_ceiling=True,
++        price=Price(
++            version="v1",
++            input_per_million=1,
++            cached_input_per_million=1,
++            output_per_million=1,
++        ),
++    )
++
++
++async def test_cloud_only_bypasses_local_and_still_rejects_local_only_keys():
++    local_calls = []
++
++    async def forbidden_local(*args):
++        local_calls.append(args)
++        raise AssertionError("local dispatch in cloud-only mode")
++
++    calls = []
++
++    async def handler(request):
++        calls.append(request)
++        return httpx.Response(
++            200,
++            json={"usage": {"prompt_tokens": 2, "completion_tokens": 1, "cost": 0.01}},
++        )
++
++    cloud = OpenRouter(
++        "secret",
++        httpx.AsyncClient(
++            transport=httpx.MockTransport(handler), base_url="https://cloud/"
++        ),
++    )
++    client, runtime, store = setup_gateway(
++        policy(local_policy="prefer", cloud_fallback=True, max_cloud_cost_usd=1),
++        GatewayConfig(aliases={"coder": cloud_alias()}, cloud_enabled=True),
++        cloud,
++        forbidden_local,
++    )
++    store.mode = "cloud_only"
++    async with client:
++        response = await client.post(
++            "/v1/chat/completions", json={"model": "coder", "messages": []}
++        )
++        assert response.status_code == 200 and len(calls) == 1
++        store.policy = policy(local_policy="only")
++        response = await client.post(
++            "/v1/chat/completions", json={"model": "coder", "messages": []}
++        )
++        assert response.status_code == 429 and len(calls) == 1
++    assert not local_calls and not runtime.admission.active
++    await cloud.close()
++
++
++def pool_method(name):
++    # Exercise the actual small lifecycle method without importing Apple-only
++    # dependencies on Linux. Hardware tests still gate deployment on macOS.
++    source = Path("omlx/engine_pool.py").read_text()
++    tree = ast.parse(source)
++    cls = next(
++        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "EnginePool"
++    )
++    method = next(
++        n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == name
++    )
++    module = ast.Module(body=[method], type_ignores=[])
++    namespace = {}
++    exec(
++        compile(ast.fix_missing_locations(module), "engine_pool.py", "exec"), namespace
++    )
++    return namespace[name]
++
++
++async def test_drain_unloads_pinned_idle_models_but_preserves_busy_models():
++    unloaded = []
++    entries = {
++        "pinned": SimpleNamespace(
++            engine=object(), is_loading=False, is_pinned=True, in_use=0
++        ),
++        "busy": SimpleNamespace(
++            engine=object(), is_loading=False, is_pinned=False, in_use=1
++        ),
++        "loading": SimpleNamespace(
++            engine=object(), is_loading=True, is_pinned=False, in_use=0
++        ),
++    }
++
++    async def unload(name):
++        unloaded.append(name)
++        entries[name].engine = None
++
++    pool = SimpleNamespace(
++        _lock=asyncio.Lock(),
++        _entries=entries,
++        _entry_is_quiescent=lambda e: e.in_use == 0,
++        _unload_engine=unload,
++        get_loaded_model_ids=lambda: [
++            k for k, e in entries.items() if e.engine is not None
++        ],
++    )
++    state = await pool_method("unload_idle_models")(pool, include_pinned=True)
++    assert unloaded == ["pinned"] and entries["pinned"].is_pinned
++    assert state["loading_models"] == ["loading"]
++    entries["busy"].in_use = 0
++    await pool_method("unload_idle_models")(pool, include_pinned=True)
++    assert unloaded == ["pinned", "busy"]
++
++
++class TraceStore:
++    def __init__(self, failures=0):
++        self.failures = failures
++        self.batches = []
++
++    async def write_traces(self, rows):
++        if self.failures:
++            self.failures -= 1
++            raise ConnectionError("offline")
++        self.batches.append(rows)
++
++
++async def test_trace_copy_batches_and_flushes_on_shutdown():
++    store = TraceStore(failures=1)
++    writer = TraceWriter(store, max_rows=3, flush_seconds=0.01)
++    writer.start()
++    for i in range(7):
++        assert writer.submit(str(i), {"request": "hello\x00"}, 7)
++    await writer.close()
++    assert [len(b) for b in store.batches] == [3, 3, 1]
++    assert writer.written == 7 and writer.dropped == 0 and writer.queued_bytes == 0
++    assert "\\u0000" not in store.batches[0][0][3]
++
++
++async def test_trace_backpressure_drops_but_does_not_block():
++    store = TraceStore()
++    writer = TraceWriter(store, max_queue_bytes=10)
++    assert not writer.submit("id", {"request": "large payload"}, 1)
++    assert writer.dropped == 1 and not store.batches
++
++
++async def test_responses_completed_event_retains_usage():
++    from omlx.gateway.usage import UsageObserver
++
++    observer = UsageObserver("coder")
++    result = observer.feed(
++        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r","model":"physical","usage":{"input_tokens":7,"output_tokens":2}}}\n\n'
++    )
++    assert observer.completed and observer.total_tokens() == 9
++    assert b'"model":"coder"' in result
+diff --git a/tests/gateway/test_postgres.py b/tests/gateway/test_postgres.py
+new file mode 100644
+index 0000000..b85efaa
+--- /dev/null
++++ b/tests/gateway/test_postgres.py
+@@ -0,0 +1,121 @@
++"""Real PostgreSQL gates. Set GATEWAY_TEST_DSN; CI supplies PostgreSQL 16."""
++
++import asyncio
++import json
++import os
++import uuid
++from datetime import UTC, datetime, timedelta
++from decimal import Decimal
++
++import pytest
++from test_control_plane import policy
++
++from omlx.gateway.policy import GatewayConfig
++from omlx.gateway.storage.postgres import LimitExceededError, Postgres
++
++pytestmark = pytest.mark.skipif(
++    not os.getenv("GATEWAY_TEST_DSN"), reason="GATEWAY_TEST_DSN not set"
++)
++
++
++@pytest.fixture
++async def store():
++    import asyncpg
++
++    dsn = os.environ["GATEWAY_TEST_DSN"]
++    schema = "gateway_test_" + uuid.uuid4().hex
++    admin = await asyncpg.connect(dsn)
++    await admin.execute(f'CREATE SCHEMA "{schema}"')
++    pool = await asyncpg.create_pool(
++        dsn, min_size=1, max_size=8, server_settings={"search_path": schema}
++    )
++    store = Postgres(pool)
++    await store.migrate()
++    yield store
++    await store.close()
++    await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
++    await admin.close()
++
++
++async def seed(store):
++    pol = policy(
++        local_policy="prefer",
++        cloud_fallback=True,
++        max_concurrency=20,
++        daily_cloud_budget_usd=1,
++        monthly_cloud_budget_usd=2,
++        max_cloud_cost_usd=1,
++    )
++    await store.put_policy("p", pol)
++    await store.put_key("k", "digest", "p")
++    await store.cloud_switch(True)
++    return pol
++
++
++async def test_cloud_budget_race_is_atomic(store):
++    pol = await seed(store)
++    config = GatewayConfig(
++        aliases={},
++        cloud_enabled=True,
++        global_daily_cloud_budget_usd=1,
++        global_monthly_cloud_budget_usd=2,
++    )
++
++    async def reserve(i):
++        await store.begin(str(i), "k", 1, pol)
++        await store.reserve_cloud(str(i), "k", pol, config, Decimal("0.6"))
++
++    results = await asyncio.gather(
++        *(reserve(i) for i in range(10)), return_exceptions=True
++    )
++    assert sum(r is None for r in results) == 1
++    assert all(r is None or isinstance(r, LimitExceededError) for r in results)
++    assert await store.pool.fetchval(
++        "SELECT sum(cloud_reserved) FROM gateway_requests"
++    ) == Decimal("0.6")
++
++
++async def test_unknown_cloud_cost_survives_midnight_and_restart(store):
++    pol = await seed(store)
++    config = GatewayConfig(
++        aliases={},
++        cloud_enabled=True,
++        global_daily_cloud_budget_usd=1,
++        global_monthly_cloud_budget_usd=2,
++    )
++    await store.begin("old", "k", 1, pol)
++    await store.reserve_cloud("old", "k", pol, config, Decimal("0.6"))
++    await store.finish("old", "cancelled", None, None, {})
++    await store.pool.execute(
++        "UPDATE gateway_requests SET created_at=now()-interval '40 days'"
++    )
++    await store.begin("new", "k", 1, pol)
++    with pytest.raises(LimitExceededError):
++        await store.reserve_cloud("new", "k", pol, config, Decimal("0.6"))
++    await store.reconcile("old", Decimal("0.1"), 10)
++    await store.reserve_cloud("new", "k", pol, config, Decimal("0.6"))
++
++
++async def test_copy_idempotence_and_retention(store):
++    now = datetime.now(UTC)
++    rows = [
++        (
++            "one",
++            now,
++            now - timedelta(days=1),
++            json.dumps({"request": {"content": "hello"}}),
++        )
++    ]
++    await store.write_traces(rows)
++    await store.write_traces(rows)
++    assert await store.pool.fetchval("SELECT count(*) FROM gateway_traces") == 1
++    await store.prune_traces()
++    assert await store.pool.fetchval("SELECT count(*) FROM gateway_traces") == 0
++
++
++async def test_persistent_routing_mode(store):
++    assert await store.routing_mode() == "auto"
++    await store.set_routing_mode("cloud_only")
++    assert await store.routing_mode() == "cloud_only"
++    await store.report_runtime({"mode": "cloud_only", "hardware_released": True})
++    assert (await store.runtime_status())["fresh"]
+-- 
+2.51.1
+

@@ -1,0 +1,1754 @@
+From cb80743b59cf2cb18c07f8bb86916e61f029a77f Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 19 Sep 2026 13:15:58 +0200
+Subject: [PATCH 3/4] Integrate cloud routing, spend reservations, and bulk
+ JSONB logs
+
+---
+ omlx/gateway/cli.py                  | 114 +++++
+ omlx/gateway/middleware.py           | 737 +++++++++++++++++++++++++++
+ omlx/gateway/providers/__init__.py   |   1 +
+ omlx/gateway/providers/openrouter.py |  85 +++
+ omlx/gateway/storage/__init__.py     |   1 +
+ omlx/gateway/storage/object_store.py |  33 ++
+ omlx/gateway/storage/postgres.py     | 287 +++++++++++
+ omlx/gateway/storage/schema.sql      |  66 +++
+ omlx/gateway/storage/trace_writer.py | 123 +++++
+ omlx/gateway/usage.py                | 106 ++++
+ omlx/server.py                       |  23 +-
+ pyproject.toml                       |   6 +
+ 12 files changed, 1581 insertions(+), 1 deletion(-)
+ create mode 100644 omlx/gateway/cli.py
+ create mode 100644 omlx/gateway/middleware.py
+ create mode 100644 omlx/gateway/providers/__init__.py
+ create mode 100644 omlx/gateway/providers/openrouter.py
+ create mode 100644 omlx/gateway/storage/__init__.py
+ create mode 100644 omlx/gateway/storage/object_store.py
+ create mode 100644 omlx/gateway/storage/postgres.py
+ create mode 100644 omlx/gateway/storage/schema.sql
+ create mode 100644 omlx/gateway/storage/trace_writer.py
+ create mode 100644 omlx/gateway/usage.py
+
+diff --git a/omlx/gateway/cli.py b/omlx/gateway/cli.py
+new file mode 100644
+index 0000000..ece3d84
+--- /dev/null
++++ b/omlx/gateway/cli.py
+@@ -0,0 +1,114 @@
++"""Local administration; no public key-management or spend-control endpoint."""
++
++import argparse
++import asyncio
++import json
++import os
++import platform
++import subprocess
++import uuid
++from decimal import Decimal
++from pathlib import Path
++
++from .auth import create_key
++from .policy import KeyPolicy
++from .storage.postgres import Postgres
++
++
++def hardware():
++    result = {
++        "system": platform.system(),
++        "machine": platform.machine(),
++        "processor": platform.processor(),
++        "memory_bandwidth_bytes_per_second": None,
++        "bandwidth_source": "unavailable",
++    }
++    if platform.system() == "Darwin":
++        for field, name in (
++            ("memory_bytes", "hw.memsize"),
++            ("cpu", "machdep.cpu.brand_string"),
++        ):
++            value = subprocess.run(
++                ["sysctl", "-n", name], check=True, capture_output=True, text=True
++            ).stdout.strip()
++            result[field] = int(value) if field == "memory_bytes" else value
++    return result
++
++
++async def run(args):
++    if args.command == "hardware":
++        print(json.dumps(hardware(), indent=2))
++        return
++    store = await Postgres.connect(os.environ["OMLX_GATEWAY_POSTGRES_DSN"])
++    try:
++        if args.command == "migrate":
++            await store.migrate()
++        elif args.command == "prune-traces":
++            print(await store.prune_traces(args.batch_size))
++        elif args.command == "policy":
++            await store.put_policy(
++                args.id, KeyPolicy.model_validate_json(Path(args.file).read_text())
++            )
++        elif args.command == "key":
++            plaintext, digest = create_key(os.environ["OMLX_GATEWAY_PEPPER"].encode())
++            key_id = str(uuid.uuid4())
++            await store.put_key(key_id, digest, args.policy)
++            print(json.dumps({"id": key_id, "key": plaintext}))
++        elif args.command == "revoke":
++            await store.revoke(args.id)
++        elif args.command == "cloud":
++            await store.cloud_switch(args.state == "on")
++        elif args.command == "status":
++            print(json.dumps(await store.runtime_status(), indent=2))
++        elif args.command == "mode":
++            await store.set_routing_mode(args.mode)
++            if args.wait:
++                async with asyncio.timeout(args.timeout):
++                    while True:
++                        status = await store.runtime_status()
++                        if (
++                            status.get("fresh")
++                            and status.get("mode") == args.mode
++                            and (args.mode == "auto" or status.get("hardware_released"))
++                        ):
++                            print(json.dumps(status, indent=2))
++                            break
++                        await asyncio.sleep(0.5)
++            else:
++                print(json.dumps({"requested_mode": args.mode}))
++        elif args.command == "reconcile":
++            await store.reconcile(args.id, Decimal(args.cost), args.tokens)
++    finally:
++        await store.close()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    commands = parser.add_subparsers(dest="command", required=True)
++    commands.add_parser("migrate")
++    prune = commands.add_parser("prune-traces")
++    prune.add_argument("--batch-size", type=int, default=1000)
++    commands.add_parser("hardware")
++    commands.add_parser("status")
++    mode = commands.add_parser("mode")
++    mode.add_argument("mode", choices=["auto", "cloud_only"])
++    mode.add_argument("--wait", action="store_true")
++    mode.add_argument("--timeout", type=float, default=600)
++    policy = commands.add_parser("policy")
++    policy.add_argument("id")
++    policy.add_argument("file")
++    key = commands.add_parser("key")
++    key.add_argument("--policy", required=True)
++    revoke = commands.add_parser("revoke")
++    revoke.add_argument("id")
++    cloud = commands.add_parser("cloud")
++    cloud.add_argument("state", choices=["on", "off"])
++    reconcile = commands.add_parser("reconcile")
++    reconcile.add_argument("id")
++    reconcile.add_argument("--cost", required=True)
++    reconcile.add_argument("--tokens", required=True, type=int)
++    asyncio.run(run(parser.parse_args()))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/omlx/gateway/middleware.py b/omlx/gateway/middleware.py
+new file mode 100644
+index 0000000..fd6c210
+--- /dev/null
++++ b/omlx/gateway/middleware.py
+@@ -0,0 +1,737 @@
++"""Single-process ASGI control plane around the existing oMLX application."""
++
++import asyncio
++import contextlib
++import json
++import logging
++import os
++import time
++import uuid
++from pathlib import Path
++
++import httpx
++
++from omlx.scheduling import (
++    RequestControl,
++    request_control,
++    set_local_inference_suspended,
++)
++
++from .admission import Admission, AdmissionDeniedError, Ticket
++from .auth import bearer, digest_key
++from .capacity import CapacityModel, context_bucket
++from .policy import GatewayConfig
++from .pricing import costs, token_cost
++from .providers.openrouter import CircuitOpenError, OpenRouter
++from .storage.object_store import ObjectStore
++from .storage.postgres import LimitExceededError, Postgres
++from .storage.trace_writer import TraceWriter
++from .usage import UsageObserver, encode_json
++
++logger = logging.getLogger(__name__)
++AUTHORIZED = object()
++PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/completions"}
++FIELDS = {
++    "model",
++    "messages",
++    "input",
++    "prompt",
++    "instructions",
++    "tools",
++    "tool_choice",
++    "parallel_tool_calls",
++    "response_format",
++    "text",
++    "temperature",
++    "top_p",
++    "top_k",
++    "min_p",
++    "max_tokens",
++    "max_completion_tokens",
++    "max_output_tokens",
++    "stop",
++    "seed",
++    "presence_penalty",
++    "frequency_penalty",
++    "repetition_penalty",
++    "reasoning",
++    "reasoning_effort",
++    "stream",
++    "stream_options",
++    "n",
++    "store",
++    "metadata",
++    "user",
++    "x_gateway",
++}
++
++
++class BadRequestError(Exception):
++    pass
++
++
++async def error(send, status, code):
++    await send(
++        {
++            "type": "http.response.start",
++            "status": status,
++            "headers": [(b"content-type", b"application/json")],
++        }
++    )
++    await send(
++        {
++            "type": "http.response.body",
++            "body": encode_json(
++                {"error": {"message": code, "type": "gateway_error", "code": code}}
++            ),
++        }
++    )
++
++
++class Runtime:
++    def __init__(self, config, store, pepper, cloud=None, traces=None):
++        self.config = config
++        self.store = store
++        self.pepper = pepper
++        self.cloud = cloud
++        self.traces = traces
++        self.trace_writer = None
++        self.mode_task = None
++        self.sample_group = ()
++        self.sample_since = time.monotonic()
++        self.last_capacity_sample = time.monotonic()
++        self.admission = Admission(
++            CapacityModel(config.capacity_points, config.capacity_margin),
++            config.max_queue_depth,
++        )
++
++    @classmethod
++    async def from_environment(cls, path):
++        config = GatewayConfig.model_validate_json(Path(path).read_text())
++        pepper = os.environ["OMLX_GATEWAY_PEPPER"].encode()
++        digest_key("startup-validation", pepper)
++        store = await Postgres.connect(os.environ["OMLX_GATEWAY_POSTGRES_DSN"])
++        await store.claim_appliance()
++        cloud = (
++            OpenRouter(os.environ["OPENROUTER_API_KEY"])
++            if config.cloud_enabled
++            else None
++        )
++        traces = (
++            ObjectStore(
++                os.environ["OMLX_GATEWAY_TRACE_BUCKET"],
++                os.getenv("OMLX_GATEWAY_S3_ENDPOINT"),
++            )
++            if os.getenv("OMLX_GATEWAY_TRACE_BUCKET")
++            else None
++        )
++        runtime = cls(config, store, pepper, cloud, traces)
++        # Explicit operator benchmarks override persisted observations.
++        runtime.admission.capacity = CapacityModel(
++            (*await store.capacity_points(), *config.capacity_points),
++            config.capacity_margin,
++        )
++        await runtime.refresh_mode()
++        runtime.mode_task = asyncio.create_task(runtime.watch_mode())
++        if config.trace_backend == "postgres":
++            runtime.trace_writer = TraceWriter(store)
++            runtime.trace_writer.start()
++        return runtime
++
++    async def refresh_mode(self):
++        mode = await self.store.routing_mode()
++        if mode not in ("auto", "cloud_only"):
++            raise RuntimeError("Missing or invalid gateway routing mode")
++        await self.admission.set_mode(mode)
++        set_local_inference_suspended(mode == "cloud_only")
++        return mode
++
++    async def watch_mode(self):
++        while True:
++            try:
++                mode = await self.refresh_mode()
++                state = {
++                    "mode": mode,
++                    "active_local": len(self.admission.active),
++                    "hardware_released": False,
++                }
++                state["queue_depth"] = len(self.admission.waiting)
++                state["streams"] = {
++                    ticket.request_id: ticket.metrics.snapshot()
++                    for ticket in self.admission.active.values()
++                }
++                state["bandwidth_bytes_per_second"] = None
++                state["bandwidth_source"] = "unavailable"
++                if self.trace_writer:
++                    state["logging"] = {
++                        "queued_bytes": self.trace_writer.queued_bytes,
++                        "written": self.trace_writer.written,
++                        "dropped": self.trace_writer.dropped,
++                    }
++                await self.sample_capacity()
++                if mode == "cloud_only":
++                    from omlx.server import get_engine_pool
++
++                    pool = get_engine_pool()
++                    if pool is not None:
++                        state.update(await pool.unload_idle_models(include_pinned=True))
++                        state["hardware_released"] = (
++                            not state["loaded_models"]
++                            and not state["loading_models"]
++                            and not self.admission.active
++                        )
++                await self.store.report_runtime(state)
++            except Exception:
++                await self.admission.set_mode("unavailable")
++                set_local_inference_suspended(True)
++                logger.error("Gateway routing control unavailable")
++            await asyncio.sleep(1)
++
++    async def sample_capacity(self):
++        active = list(self.admission.active.values())
++        group = tuple(sorted(t.request_id for t in active))
++        now = time.monotonic()
++        if group != self.sample_group:
++            self.sample_group, self.sample_since = group, now
++        # Sample only a stable all-decode cohort. Do not teach pure-decode
++        # estimates from cold prefill or a changing concurrency window.
++        if (
++            not active
++            or now - self.sample_since < 5
++            or now - self.last_capacity_sample < 5
++        ):
++            return
++        if any(
++            t.metrics.first_token is None or now - t.metrics.first_token < 5
++            for t in active
++        ):
++            return
++        if len({t.configuration for t in active}) != 1:
++            return
++        aggregate = sum(t.metrics.snapshot()["rolling_5s_tps"] or 0 for t in active)
++        if aggregate <= 0:
++            return
++        configuration = active[0].configuration
++        bucket = max(t.bucket for t in active)
++        model = self.admission.capacity
++        model.observe(configuration, bucket, len(active), aggregate)
++        await self.store.record_capacity(
++            configuration,
++            bucket,
++            len(active),
++            model.points[(configuration, bucket, len(active))],
++        )
++        self.last_capacity_sample = now
++
++    async def close(self):
++        if self.mode_task:
++            self.mode_task.cancel()
++            with contextlib.suppress(asyncio.CancelledError):
++                await self.mode_task
++        if self.trace_writer:
++            await self.trace_writer.close()
++        if self.cloud:
++            await self.cloud.close()
++        await self.store.close()
++
++
++def validate_body(body, policy, config):
++    if not isinstance(body, dict) or set(body) - FIELDS:
++        raise BadRequestError("unsupported_request_fields")
++    if not isinstance(body.get("model"), str):
++        raise BadRequestError("model_alias_required")
++    name = body["model"]
++    if name not in policy.allowed_model_aliases or name not in config.aliases:
++        raise BadRequestError("model_not_allowed")
++    if body.get("n", 1) != 1:
++        raise BadRequestError("only_single_completion_supported")
++    if not isinstance(body.get("stream", False), bool):
++        raise BadRequestError("stream_must_be_boolean")
++    stream_options = body.get("stream_options", {})
++    if not isinstance(stream_options, dict) or set(stream_options) - {"include_usage"}:
++        raise BadRequestError("invalid_stream_options")
++    if not isinstance(stream_options.get("include_usage", False), bool):
++        raise BadRequestError("invalid_stream_usage_option")
++    if body.get("store"):
++        raise BadRequestError("stateful_responses_not_enabled")
++    # Until model-specific multimodal token accounting exists, accept text and
++    # function tools only. This also excludes paid web-search/plugin execution.
++    for tool in body.get("tools", []):
++        if not isinstance(tool, dict) or tool.get("type") != "function":
++            raise BadRequestError("only_function_tools_supported")
++
++    def check_text(value):
++        if isinstance(value, dict):
++            kind = value.get("type", "")
++            if any(part in kind for part in ("image", "audio", "video", "file")):
++                raise BadRequestError("multimodal_accounting_not_enabled")
++            for child in value.values():
++                check_text(child)
++        elif isinstance(value, list):
++            for child in value:
++                check_text(child)
++
++    check_text(body.get("messages", body.get("input", body.get("prompt", ""))))
++    limits = [
++        body[k]
++        for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")
++        if k in body
++    ]
++    if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in limits):
++        raise BadRequestError("invalid_output_limit")
++    if len(limits) > 1:
++        raise BadRequestError("ambiguous_output_limits")
++    limit = limits[0] if limits else policy.max_output_tokens
++    if limit > policy.max_output_tokens:
++        raise BadRequestError("output_limit_exceeded")
++    # Conservative envelope, NOT a model tokenizer. Runtime enforces the exact
++    # local prompt+output token limit before prefill through RequestControl.
++    envelope = len(encode_json(body)) + 1024
++    if envelope + limit > policy.max_context_tokens:
++        raise BadRequestError("context_envelope_exceeded")
++    extension = body.pop("x_gateway", {})
++    if not isinstance(extension, dict) or set(extension) - {"include_usage"}:
++        raise BadRequestError("unsupported_gateway_option")
++    include_usage = extension.get("include_usage", False)
++    if not isinstance(include_usage, bool):
++        raise BadRequestError("invalid_gateway_usage_option")
++    return name, config.aliases[name], limit, envelope, include_usage
++
++
++class GatewayMiddleware:
++    def __init__(self, app, config_path=None, runtime=None):
++        self.app = app
++        self.config_path = config_path
++        self.runtime = runtime
++
++    async def __call__(self, scope, receive, send):
++        if scope["type"] == "lifespan":
++            try:
++                if self.runtime is None:
++                    self.runtime = await Runtime.from_environment(self.config_path)
++                await self.app(scope, receive, send)
++            finally:
++                if self.runtime:
++                    await self.runtime.close()
++            return
++        if scope["type"] != "http" or not scope["path"].startswith("/v1"):
++            await self.app(scope, receive, send)
++            return
++        runtime = self.runtime
++        if runtime is None:
++            await error(send, 503, "gateway_not_ready")
++            return
++        key = bearer(scope.get("headers", []))
++        try:
++            identity = (
++                await runtime.store.identity(digest_key(key, runtime.pepper))
++                if key
++                else None
++            )
++        except Exception:
++            logger.error("Gateway authentication storage unavailable")
++            await error(send, 503, "authentication_unavailable")
++            return
++        if identity is None:
++            await error(send, 401, "invalid_api_key")
++            return
++        key_id, version, policy = identity
++        path = scope["path"]
++        if path == "/v1/models" and scope["method"] == "GET":
++            await send(
++                {
++                    "type": "http.response.start",
++                    "status": 200,
++                    "headers": [(b"content-type", b"application/json")],
++                }
++            )
++            await send(
++                {
++                    "type": "http.response.body",
++                    "body": encode_json(
++                        {
++                            "object": "list",
++                            "data": [
++                                {
++                                    "id": name,
++                                    "object": "model",
++                                    "created": 0,
++                                    "owned_by": "gateway",
++                                }
++                                for name in policy.allowed_model_aliases
++                                if name in runtime.config.aliases
++                            ],
++                        }
++                    ),
++                }
++            )
++            return
++        if path not in PATHS or scope["method"] != "POST":
++            await error(send, 404, "gateway_endpoint_not_enabled")
++            return
++        body_bytes = bytearray()
++        try:
++            async with asyncio.timeout(15):
++                while True:
++                    message = await receive()
++                    if message["type"] == "http.disconnect":
++                        return
++                    body_bytes.extend(message.get("body", b""))
++                    if len(body_bytes) > runtime.config.max_request_bytes:
++                        raise BadRequestError("request_too_large")
++                    if not message.get("more_body", False):
++                        break
++            body = json.loads(body_bytes)
++            name, alias, limit, envelope, detailed = validate_body(
++                body, policy, runtime.config
++            )
++        except (
++            BadRequestError,
++            ValueError,
++            TypeError,
++            AttributeError,
++            TimeoutError,
++        ) as exc:
++            await error(
++                send,
++                400,
++                str(exc) if isinstance(exc, BadRequestError) else "invalid_request",
++            )
++            return
++        for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
++            body.pop(field, None)
++        if path == "/v1/responses":
++            body["max_output_tokens"] = limit
++            body["store"] = False
++        else:
++            body["max_tokens"] = limit
++        ticket = Ticket(
++            str(uuid.uuid4()),
++            key_id,
++            policy,
++            alias.configuration,
++            context_bucket(envelope + limit),
++        )
++        try:
++            await runtime.store.begin(ticket.request_id, key_id, version, policy)
++        except LimitExceededError as exc:
++            await error(send, 429, str(exc))
++            return
++        except Exception:
++            await error(send, 503, "accounting_unavailable")
++            return
++
++        # Monitor disconnect independently while queued AND while dispatching.
++        async def disconnect():
++            while True:
++                if (await receive())["type"] == "http.disconnect":
++                    return
++
++        disconnected = asyncio.Event()
++
++        async def watch_disconnect():
++            await disconnect()
++            disconnected.set()
++
++        watcher = asyncio.create_task(watch_disconnect())
++        work = asyncio.create_task(
++            self.dispatch(
++                scope, body, send, ticket, name, alias, detailed, disconnected
++            )
++        )
++        try:
++            done, _ = await asyncio.wait(
++                {watcher, work}, return_when=asyncio.FIRST_COMPLETED
++            )
++            if work not in done:
++                work.cancel()
++            await work
++        except asyncio.CancelledError:
++            work.cancel()
++            await asyncio.gather(work, return_exceptions=True)
++        finally:
++            watcher.cancel()
++            await asyncio.gather(watcher, return_exceptions=True)
++
++    async def dispatch(
++        self, scope, body, send, ticket, name, alias, detailed, disconnected
++    ):
++        runtime, policy = self.runtime, ticket.policy
++        route = "local"
++        queue_ms = 0
++        cloud_reserved = False
++        dispatched = False
++        started = False
++        streaming = False
++        status = "failed"
++        status_code = 500
++        response_body = bytearray()
++        trace_response = bytearray()
++        trace_truncated = False
++        local_started = None
++        control_token = None
++
++        def extension(usage):
++            return {
++                "request_id": ticket.request_id,
++                "route": route,
++                "provider": "openrouter" if route == "cloud" else "local",
++                "physical_model": alias.cloud_model
++                if route == "cloud"
++                else alias.local_model,
++                "queue_ms": queue_ms,
++                "telemetry": ticket.metrics.snapshot() if route == "local" else None,
++                "cost": costs(
++                    runtime.config,
++                    alias,
++                    usage,
++                    route,
++                    runtime.admission.allocated_seconds(ticket),
++                ),
++            }
++
++        observer = UsageObserver(
++            name,
++            extension if detailed else None,
++            include_stream_usage=(
++                scope["path"] == "/v1/responses"
++                or detailed
++                or bool(body.get("stream_options", {}).get("include_usage"))
++            ),
++        )
++
++        async def response_send(message):
++            nonlocal started, streaming, status_code, trace_truncated
++            if message["type"] == "http.response.start":
++                started = True
++                status_code = message["status"]
++                headers = [
++                    (k, v)
++                    for k, v in message.get("headers", [])
++                    if k.lower() not in (b"content-length", b"content-encoding")
++                ]
++                streaming = any(
++                    k.lower() == b"content-type" and b"text/event-stream" in v
++                    for k, v in headers
++                )
++                headers.append((b"x-request-id", ticket.request_id.encode()))
++                await send({**message, "headers": headers})
++                return
++            if message["type"] != "http.response.body":
++                await send(message)
++                return
++            data = message.get("body", b"")
++            final = not message.get("more_body", False)
++            if streaming:
++                data = observer.feed(data, final)
++            else:
++                response_body.extend(data)
++                if len(response_body) > 16 * 1024 * 1024:
++                    raise ValueError("provider response too large")
++                if not final:
++                    return
++                try:
++                    data = encode_json(observer.document(json.loads(response_body)))
++                    observer.completed = True
++                except (ValueError, UnicodeDecodeError):
++                    observer.failed = True
++                    data = bytes(response_body)
++            if policy.logging_policy == "full":
++                available = runtime.config.max_trace_bytes - len(trace_response)
++                trace_response.extend(data[:available])
++                trace_truncated |= len(data) > available
++            await send({**message, "body": data})
++
++        try:
++            async with asyncio.timeout(runtime.config.request_timeout_seconds):
++                mode = await runtime.refresh_mode()
++                if mode == "cloud_only" and policy.local_policy == "only":
++                    raise LimitExceededError("cloud_only_mode_local_only_key")
++                if (
++                    mode == "cloud_only"
++                    and policy.local_policy == "prefer"
++                    and not policy.cloud_fallback
++                ):
++                    raise LimitExceededError("cloud_only_mode_fallback_disabled")
++                if policy.local_policy == "never" or mode == "cloud_only":
++                    route = "cloud"
++                else:
++                    try:
++                        queue_ms = await runtime.admission.acquire(ticket)
++                    except AdmissionDeniedError as exc:
++                        if (
++                            exc.action != "cloud"
++                            or policy.local_policy == "only"
++                            or not policy.cloud_fallback
++                        ):
++                            raise
++                        route = "cloud"
++                if route == "cloud":
++                    if (
++                        not runtime.cloud
++                        or not alias.cloud_model
++                        or not alias.price
++                        or not alias.cloud_price_is_ceiling
++                    ):
++                        raise LimitExceededError(
++                            "cloud_not_configured_with_price_ceiling"
++                        )
++                    if not alias.provider_only:
++                        raise LimitExceededError("cloud_provider_allowlist_required")
++                    reservation = token_cost(
++                        alias.price, policy.max_context_tokens, policy.max_output_tokens
++                    )
++                    await runtime.store.reserve_cloud(
++                        ticket.request_id,
++                        ticket.key_id,
++                        policy,
++                        runtime.config,
++                        reservation,
++                    )
++                    cloud_reserved = True
++                    dispatched = True
++                    await runtime.cloud.serve(scope["path"], body, alias, response_send)
++                else:
++                    local_started = time.monotonic()
++                    body["model"] = alias.local_model
++                    # Always request upstream usage internally for accounting.
++                    if body.get("stream") and scope["path"] != "/v1/responses":
++                        body["stream_options"] = {"include_usage": True}
++                    payload = encode_json(body)
++                    delivered = False
++
++                    async def local_receive():
++                        nonlocal delivered
++                        if not delivered:
++                            delivered = True
++                            return {
++                                "type": "http.request",
++                                "body": payload,
++                                "more_body": False,
++                            }
++                        await disconnected.wait()
++                        return {"type": "http.disconnect"}
++
++                    local_scope = dict(scope)
++                    local_scope["omlx.gateway.authorized"] = AUTHORIZED
++                    local_scope["headers"] = [
++                        (k, v)
++                        for k, v in scope.get("headers", [])
++                        if k.lower()
++                        not in (b"content-length", b"authorization", b"x-api-key")
++                    ]
++                    local_scope["headers"].append(
++                        (b"content-length", str(len(payload)).encode())
++                    )
++                    control_token = request_control.set(
++                        RequestControl(
++                            priority=policy.priority,
++                            weight=policy.scheduling_weight,
++                            max_context_tokens=policy.max_context_tokens,
++                            on_token=ticket.metrics.observe,
++                        )
++                    )
++                    dispatched = True
++                    await self.app(local_scope, local_receive, response_send)
++                status = (
++                    "complete"
++                    if status_code < 400 and observer.completed and not observer.failed
++                    else "failed"
++                )
++        except asyncio.CancelledError:
++            status = "cancelled"
++            raise
++        except (AdmissionDeniedError, LimitExceededError, CircuitOpenError) as exc:
++            if not started:
++                await error(send, 429, str(exc))
++        except (TimeoutError, httpx.HTTPError, ValueError):
++            if not started:
++                await error(send, 503, "inference_unavailable")
++            elif streaming:
++                await send(
++                    {
++                        "type": "http.response.body",
++                        "body": b'data: {"error":{"code":"gateway_stream_failed","message":"Generation interrupted"}}\n\n',
++                        "more_body": False,
++                    }
++                )
++        except Exception:
++            logger.error("Gateway request failed: %s", ticket.request_id)
++            if not started:
++                await error(send, 503, "gateway_unavailable")
++        finally:
++            if control_token is not None:
++                request_control.reset(control_token)
++
++            # Cleanup/accounting is shielded from disconnect cancellation.
++            async def finalize():
++                allocated = runtime.admission.allocated_seconds(ticket)
++                await runtime.admission.release(ticket)
++                accounting = costs(
++                    runtime.config, alias, observer.usage, route, allocated
++                )
++                actual_cloud = (
++                    accounting["cash_cogs"]
++                    if route == "cloud" and cloud_reserved
++                    else None
++                )
++                if not dispatched:
++                    actual_cloud = 0
++                metadata = {
++                    "route": route,
++                    "alias": name,
++                    "queue_ms": queue_ms,
++                    "usage": observer.usage,
++                    "cost": accounting,
++                    "provider_id": observer.provider_id,
++                    "configuration": alias.configuration,
++                    "allocated_busy_seconds": allocated,
++                    "telemetry": ticket.metrics.snapshot() if local_started else None,
++                }
++                trace_key = None
++                if policy.logging_policy == "full":
++                    # Bound BOTH input and output logging independently.
++                    request_size = len(encode_json(body))
++                    trace = {
++                        "request": body
++                        if request_size <= runtime.config.max_trace_bytes
++                        else None,
++                        "request_truncated": request_size
++                        > runtime.config.max_trace_bytes,
++                        "request_bytes": request_size,
++                        "response": trace_response.decode("utf-8", errors="replace"),
++                        "response_truncated": trace_truncated,
++                    }
++                if policy.logging_policy == "full" and runtime.trace_writer:
++                    queued = runtime.trace_writer.submit(
++                        ticket.request_id, trace, policy.trace_ttl_days
++                    )
++                    metadata["trace_status"] = "queued" if queued else "dropped"
++                    trace_key = f"postgres:{ticket.request_id}" if queued else None
++                elif policy.logging_policy == "full" and runtime.traces:
++                    try:
++                        trace_key = await runtime.traces.put(
++                            ticket.request_id, trace, policy.trace_ttl_days
++                        )
++                    except Exception:
++                        metadata["trace_status"] = "write_failed"
++                        logger.error(
++                            "Gateway trace write failed: %s", ticket.request_id
++                        )
++                elif policy.logging_policy == "full":
++                    metadata["trace_status"] = "not_configured"
++                if policy.logging_policy == "none":
++                    metadata = {
++                        "provider_id": observer.provider_id
++                    }  # Minimal spend ledger remains mandatory.
++                tokens = observer.total_tokens() if dispatched else 0
++                await runtime.store.finish(
++                    ticket.request_id, status, tokens, actual_cloud, metadata, trace_key
++                )
++
++            cleanup = asyncio.create_task(finalize())
++            try:
++                await asyncio.shield(cleanup)
++            except asyncio.CancelledError:
++                await cleanup
++                raise
+diff --git a/omlx/gateway/providers/__init__.py b/omlx/gateway/providers/__init__.py
+new file mode 100644
+index 0000000..2f86cf6
+--- /dev/null
++++ b/omlx/gateway/providers/__init__.py
+@@ -0,0 +1 @@
++"""Provider adapters."""
+diff --git a/omlx/gateway/providers/openrouter.py b/omlx/gateway/providers/openrouter.py
+new file mode 100644
+index 0000000..e29f42b
+--- /dev/null
++++ b/omlx/gateway/providers/openrouter.py
+@@ -0,0 +1,85 @@
++"""Streaming OpenRouter transport with explicit provider policy and no replay."""
++
++import time
++
++import httpx
++
++
++class CircuitOpenError(Exception):
++    pass
++
++
++class OpenRouter:
++    def __init__(self, api_key, client=None):
++        self.api_key = api_key
++        self.client = client or httpx.AsyncClient(
++            base_url="https://openrouter.ai/api/v1/",
++            timeout=httpx.Timeout(60, connect=10),
++            follow_redirects=False,
++        )
++        self.failures = 0
++        self.open_until = 0
++
++    async def close(self):
++        await self.client.aclose()
++
++    def failed(self):
++        self.failures += 1
++        if self.failures >= 3:
++            self.open_until = time.monotonic() + 30
++
++    async def serve(self, path, body, alias, send):
++        if time.monotonic() < self.open_until:
++            raise CircuitOpenError("cloud_circuit_open")
++        payload = dict(body)
++        # Routing controls are never inherited from a caller's JSON.
++        for field in ("models", "route", "provider", "plugins", "transforms", "usage"):
++            payload.pop(field, None)
++        payload["model"] = alias.cloud_model
++        payload["provider"] = {
++            "order": list(alias.provider_order),
++            "only": list(alias.provider_only),
++            "allow_fallbacks": alias.allow_provider_fallback,
++            "require_parameters": True,
++        }
++        # Reject paid plugins and auxiliary services at gateway validation.
++        # Pricing ceiling must cover every permitted provider and output token.
++        response = None
++        try:
++            request = self.client.build_request(
++                "POST",
++                path.removeprefix("/v1/"),
++                json=payload,
++                headers={"Authorization": f"Bearer {self.api_key}"},
++            )
++            response = await self.client.send(request, stream=True)
++            if response.status_code >= 500 or response.status_code == 429:
++                self.failed()
++            else:
++                self.failures = 0
++            headers = [
++                (
++                    b"content-type",
++                    response.headers.get("content-type", "application/json").encode(),
++                )
++            ]
++            await send(
++                {
++                    "type": "http.response.start",
++                    "status": response.status_code,
++                    "headers": headers,
++                }
++            )
++            async for data in response.aiter_bytes():
++                await send(
++                    {"type": "http.response.body", "body": data, "more_body": True}
++                )
++            await send({"type": "http.response.body", "body": b"", "more_body": False})
++        except httpx.HTTPError:
++            self.failed()
++            raise
++        finally:
++            if response is not None:
++                await response.aclose()
++        # No retries after dispatch: timeout does not prove the provider did
++        # not execute/charge. Each future explicit retry needs a new reservation.
+diff --git a/omlx/gateway/storage/__init__.py b/omlx/gateway/storage/__init__.py
+new file mode 100644
+index 0000000..87d94a7
+--- /dev/null
++++ b/omlx/gateway/storage/__init__.py
+@@ -0,0 +1 @@
++"""Metadata and trace storage adapters."""
+diff --git a/omlx/gateway/storage/object_store.py b/omlx/gateway/storage/object_store.py
+new file mode 100644
+index 0000000..8cf0d45
+--- /dev/null
++++ b/omlx/gateway/storage/object_store.py
+@@ -0,0 +1,33 @@
++"""Opt-in bounded traces. Credentials come from the standard AWS chain."""
++
++import asyncio
++import gzip
++import json
++from datetime import UTC, datetime, timedelta
++
++
++class ObjectStore:
++    def __init__(self, bucket, endpoint_url=None):
++        import boto3
++
++        self.client = boto3.client("s3", endpoint_url=endpoint_url)
++        self.bucket = bucket
++
++    async def put(self, request_id, document, ttl_days):
++        now = datetime.now(UTC)
++        key = f"traces/{now:%Y/%m/%d}/{request_id}.json.gz"
++        body = gzip.compress(json.dumps(document, default=str).encode())
++        # Expires is metadata, NOT an S3 deletion policy. Operators must install
++        # bucket lifecycle rules for each retention tag before enabling full logs.
++        await asyncio.to_thread(
++            self.client.put_object,
++            Bucket=self.bucket,
++            Key=key,
++            Body=body,
++            ContentType="application/json",
++            ContentEncoding="gzip",
++            ServerSideEncryption="AES256",
++            Tagging=f"retention_days={ttl_days}",
++            Expires=now + timedelta(days=ttl_days),
++        )
++        return key
+diff --git a/omlx/gateway/storage/postgres.py b/omlx/gateway/storage/postgres.py
+new file mode 100644
+index 0000000..4d89f47
+--- /dev/null
++++ b/omlx/gateway/storage/postgres.py
+@@ -0,0 +1,287 @@
++"""Atomic quotas and spend reservations. Database errors fail admission closed."""
++
++import json
++from decimal import Decimal
++from pathlib import Path
++
++from ..policy import CapacityPoint, KeyPolicy
++
++# One database transaction lock covers both global and per-key counters.
++# Deliberately simple for a single appliance; no check-then-increment race.
++LEDGER_LOCK = 72709131
++APPLIANCE_LOCK = 72709132
++
++
++class LimitExceededError(Exception):
++    pass
++
++
++class Postgres:
++    def __init__(self, pool):
++        self.pool = pool
++        self.owner = None
++
++    @classmethod
++    async def connect(cls, dsn):
++        import asyncpg
++
++        return cls(
++            await asyncpg.create_pool(dsn, min_size=1, max_size=8, command_timeout=15)
++        )
++
++    async def claim_appliance(self):
++        self.owner = await self.pool.acquire()
++        if not await self.owner.fetchval(
++            "SELECT pg_try_advisory_lock($1)", APPLIANCE_LOCK
++        ):
++            await self.pool.release(self.owner)
++            self.owner = None
++            raise RuntimeError("Gateway supports one serving process per database")
++
++    async def close(self):
++        if self.owner:
++            await self.pool.release(self.owner)
++        await self.pool.close()
++
++    async def migrate(self):
++        await self.pool.execute(Path(__file__).with_name("schema.sql").read_text())
++
++    async def identity(self, digest):
++        row = await self.pool.fetchrow(
++            "SELECT k.id, p.version, p.document FROM gateway_keys k "
++            "JOIN gateway_policies p ON p.id=k.policy_id "
++            "WHERE k.digest=$1 AND k.enabled",
++            digest,
++        )
++        if row is None:
++            return None
++        policy = KeyPolicy.model_validate_json(row["document"])
++        return (row["id"], row["version"], policy) if policy.enabled else None
++
++    async def begin(self, request_id, key_id, policy_version, policy):
++        async with self.pool.acquire() as connection, connection.transaction():
++            await connection.execute("SELECT pg_advisory_xact_lock($1)", LEDGER_LOCK)
++            valid = await connection.fetchval(
++                "SELECT k.enabled AND (p.document->>'enabled')::boolean "
++                "AND p.version=$2 FROM gateway_keys k JOIN gateway_policies p "
++                "ON k.policy_id=p.id WHERE k.id=$1",
++                key_id,
++                policy_version,
++            )
++            if not valid:
++                raise LimitExceededError("policy_changed_or_key_disabled")
++            count = await connection.fetchval(
++                "SELECT count(*) FROM gateway_requests WHERE key_id=$1 AND status='running'",
++                key_id,
++            )
++            if count >= policy.max_concurrency:
++                raise LimitExceededError("key_concurrency")
++            used = await connection.fetchval(
++                "SELECT COALESCE(sum(COALESCE(tokens_actual,tokens_reserved)),0) "
++                "FROM gateway_requests WHERE key_id=$1 AND "
++                "(created_at >= date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' "
++                "OR tokens_actual IS NULL)",
++                key_id,
++            )
++            if (
++                policy.daily_token_quota is not None
++                and used + policy.max_context_tokens > policy.daily_token_quota
++            ):
++                raise LimitExceededError("daily_token_quota")
++            await connection.execute(
++                "INSERT INTO gateway_requests(id,key_id,policy_version,tokens_reserved) VALUES($1,$2,$3,$4)",
++                request_id,
++                key_id,
++                policy_version,
++                policy.max_context_tokens,
++            )
++
++    async def reserve_cloud(self, request_id, key_id, policy, config, amount):
++        if amount <= 0 or amount > policy.max_cloud_cost_usd:
++            raise LimitExceededError("request_cloud_budget")
++        async with self.pool.acquire() as connection, connection.transaction():
++            await connection.execute("SELECT pg_advisory_xact_lock($1)", LEDGER_LOCK)
++            enabled = await connection.fetchval(
++                "SELECT enabled FROM gateway_switches WHERE id='cloud'"
++            )
++            if not config.cloud_enabled or not enabled:
++                raise LimitExceededError("cloud_disabled")
++            previous = await connection.fetchval(
++                "SELECT cloud_reserved FROM gateway_requests WHERE id=$1 AND key_id=$2 AND status='running' FOR UPDATE",
++                request_id,
++                key_id,
++            )
++            if previous is None or previous != 0:
++                raise LimitExceededError("invalid_reservation_state")
++            for window, key_limit, global_limit in (
++                (
++                    "day",
++                    policy.daily_cloud_budget_usd,
++                    config.global_daily_cloud_budget_usd,
++                ),
++                (
++                    "month",
++                    policy.monthly_cloud_budget_usd,
++                    config.global_monthly_cloud_budget_usd,
++                ),
++            ):
++                row = await connection.fetchrow(
++                    "SELECT COALESCE(sum(COALESCE(cloud_actual,cloud_reserved)) FILTER(WHERE key_id=$1),0) AS key_used, "
++                    "COALESCE(sum(COALESCE(cloud_actual,cloud_reserved)),0) AS total "
++                    "FROM gateway_requests WHERE created_at >= date_trunc($2,now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' "
++                    "OR (cloud_actual IS NULL AND cloud_reserved>0)",
++                    key_id,
++                    window,
++                )
++                if (
++                    row["key_used"] + amount > key_limit
++                    or row["total"] + amount > global_limit
++                ):
++                    raise LimitExceededError(f"{window}_cloud_budget")
++            await connection.execute(
++                "UPDATE gateway_requests SET cloud_reserved=$2 WHERE id=$1",
++                request_id,
++                amount,
++            )
++
++    async def finish(
++        self, request_id, status, tokens, cloud_cost, metadata, trace_key=None
++    ):
++        # Unknown cloud cost remains NULL, preserving the reservation across
++        # UTC rollovers and restart. Only an explicit reconciliation releases it.
++        async with self.pool.acquire() as connection, connection.transaction():
++            await connection.execute("SELECT pg_advisory_xact_lock($1)", LEDGER_LOCK)
++            await connection.execute(
++                "UPDATE gateway_requests SET status=$2, finished_at=now(), tokens_actual=$3, "
++                "cloud_actual=$4, metadata=$5::jsonb, trace_key=$6, provider_id=$7 "
++                "WHERE id=$1 AND status='running'",
++                request_id,
++                status,
++                tokens,
++                cloud_cost,
++                json.dumps(metadata, default=str),
++                trace_key,
++                metadata.get("provider_id"),
++            )
++            if cloud_cost is not None:
++                reserved = await connection.fetchval(
++                    "SELECT cloud_reserved FROM gateway_requests WHERE id=$1",
++                    request_id,
++                )
++                if cloud_cost > reserved:
++                    # A rate ceiling was wrong: persist the real cost and trip.
++                    await connection.execute(
++                        "UPDATE gateway_switches SET enabled=false WHERE id='cloud'"
++                    )
++
++    async def put_policy(self, policy_id, policy):
++        await self.pool.execute(
++            "INSERT INTO gateway_policies(id,document) VALUES($1,$2::jsonb) "
++            "ON CONFLICT(id) DO UPDATE SET document=EXCLUDED.document, version=gateway_policies.version+1",
++            policy_id,
++            policy.model_dump_json(),
++        )
++
++    async def write_traces(self, rows):
++        async with self.pool.acquire() as connection, connection.transaction():
++            await connection.execute(
++                "CREATE TEMP TABLE IF NOT EXISTS gateway_trace_batch "
++                "(LIKE gateway_traces INCLUDING DEFAULTS) ON COMMIT DELETE ROWS"
++            )
++            await connection.copy_records_to_table(
++                "gateway_trace_batch",
++                records=rows,
++                columns=("request_id", "created_at", "expires_at", "payload"),
++            )
++            await connection.execute(
++                "INSERT INTO gateway_traces SELECT * FROM gateway_trace_batch "
++                "ON CONFLICT(request_id) DO NOTHING"
++            )
++
++    async def prune_traces(self, batch_size=1000):
++        return await self.pool.execute(
++            "DELETE FROM gateway_traces WHERE request_id IN ("
++            "SELECT request_id FROM gateway_traces WHERE expires_at < now() "
++            "ORDER BY expires_at LIMIT $1)",
++            batch_size,
++        )
++
++    async def put_key(self, key_id, digest, policy_id):
++        await self.pool.execute(
++            "INSERT INTO gateway_keys(id,digest,policy_id) VALUES($1,$2,$3)",
++            key_id,
++            digest,
++            policy_id,
++        )
++
++    async def revoke(self, key_id):
++        await self.pool.execute(
++            "UPDATE gateway_keys SET enabled=false WHERE id=$1", key_id
++        )
++
++    async def cloud_switch(self, enabled):
++        await self.pool.execute(
++            "UPDATE gateway_switches SET enabled=$1 WHERE id='cloud'", enabled
++        )
++
++    async def routing_mode(self):
++        return await self.pool.fetchval(
++            "SELECT document->>'mode' FROM gateway_runtime WHERE id='routing'"
++        )
++
++    async def capacity_points(self):
++        rows = await self.pool.fetch(
++            "SELECT configuration,context_bucket,concurrency,aggregate_tps,samples FROM gateway_capacity"
++        )
++        return tuple(CapacityPoint(**dict(row)) for row in rows)
++
++    async def record_capacity(self, configuration, bucket, concurrency, estimate):
++        await self.pool.execute(
++            "INSERT INTO gateway_capacity(configuration,context_bucket,concurrency,aggregate_tps,samples) "
++            "VALUES($1,$2,$3,$4,$5) ON CONFLICT(configuration,context_bucket,concurrency) DO UPDATE SET "
++            "aggregate_tps=EXCLUDED.aggregate_tps,samples=EXCLUDED.samples,updated_at=now()",
++            configuration,
++            bucket,
++            concurrency,
++            estimate.aggregate_tps,
++            estimate.samples,
++        )
++
++    async def set_routing_mode(self, mode):
++        if mode not in ("auto", "cloud_only"):
++            raise ValueError("invalid routing mode")
++        await self.pool.execute(
++            "UPDATE gateway_runtime SET document=$1::jsonb,updated_at=now() WHERE id='routing'",
++            json.dumps({"mode": mode}),
++        )
++
++    async def report_runtime(self, document):
++        await self.pool.execute(
++            "INSERT INTO gateway_runtime(id,document) VALUES('status',$1::jsonb) "
++            "ON CONFLICT(id) DO UPDATE SET document=EXCLUDED.document,updated_at=now()",
++            json.dumps(document),
++        )
++
++    async def runtime_status(self):
++        row = await self.pool.fetchrow(
++            "SELECT document, updated_at > now()-interval '5 seconds' AS fresh FROM gateway_runtime WHERE id='status'"
++        )
++        return (
++            {**json.loads(row["document"]), "fresh": row["fresh"]}
++            if row
++            else {"fresh": False}
++        )
++
++    async def reconcile(self, request_id, actual_cost, actual_tokens):
++        if actual_cost < 0 or not actual_cost.is_finite() or actual_tokens < 0:
++            raise ValueError("invalid reconciliation")
++        async with self.pool.acquire() as connection, connection.transaction():
++            await connection.execute("SELECT pg_advisory_xact_lock($1)", LEDGER_LOCK)
++            await connection.execute(
++                "UPDATE gateway_requests SET cloud_actual=$2, tokens_actual=$3, "
++                "status=CASE WHEN status='running' THEN 'reconciled' ELSE status END, "
++                "finished_at=COALESCE(finished_at,now()) WHERE id=$1",
++                request_id,
++                Decimal(actual_cost),
++                actual_tokens,
++            )
+diff --git a/omlx/gateway/storage/schema.sql b/omlx/gateway/storage/schema.sql
+new file mode 100644
+index 0000000..5a56b76
+--- /dev/null
++++ b/omlx/gateway/storage/schema.sql
+@@ -0,0 +1,66 @@
++CREATE TABLE IF NOT EXISTS gateway_policies (
++    id text PRIMARY KEY,
++    version bigint NOT NULL DEFAULT 1,
++    document jsonb NOT NULL
++);
++CREATE TABLE IF NOT EXISTS gateway_keys (
++    id text PRIMARY KEY,
++    digest text UNIQUE NOT NULL,
++    policy_id text NOT NULL REFERENCES gateway_policies(id),
++    enabled boolean NOT NULL DEFAULT true,
++    created_at timestamptz NOT NULL DEFAULT now()
++);
++CREATE TABLE IF NOT EXISTS gateway_requests (
++    id text PRIMARY KEY,
++    key_id text NOT NULL REFERENCES gateway_keys(id),
++    policy_version bigint NOT NULL,
++    created_at timestamptz NOT NULL DEFAULT now(),
++    finished_at timestamptz,
++    status text NOT NULL DEFAULT 'running',
++    tokens_reserved bigint NOT NULL CHECK(tokens_reserved >= 0),
++    tokens_actual bigint CHECK(tokens_actual >= 0),
++    cloud_reserved numeric(24,12) NOT NULL DEFAULT 0 CHECK(cloud_reserved >= 0),
++    cloud_actual numeric(24,12) CHECK(cloud_actual >= 0),
++    provider_id text,
++    metadata jsonb NOT NULL DEFAULT '{}',
++    trace_key text
++);
++CREATE INDEX IF NOT EXISTS gateway_requests_key_time
++    ON gateway_requests(key_id, created_at);
++CREATE INDEX IF NOT EXISTS gateway_requests_unsettled
++    ON gateway_requests(status) WHERE status = 'running' OR cloud_actual IS NULL;
++CREATE TABLE IF NOT EXISTS gateway_switches (
++    id text PRIMARY KEY,
++    enabled boolean NOT NULL
++);
++INSERT INTO gateway_switches(id, enabled) VALUES ('cloud', false)
++    ON CONFLICT DO NOTHING;
++
++-- Large payloads are isolated from the frequently queried spend ledger.
++-- Deliberately no blanket GIN index over prompt/response JSON.
++CREATE TABLE IF NOT EXISTS gateway_traces (
++    request_id text PRIMARY KEY,
++    created_at timestamptz NOT NULL,
++    expires_at timestamptz NOT NULL,
++    payload jsonb NOT NULL
++);
++CREATE INDEX IF NOT EXISTS gateway_traces_expiry ON gateway_traces(expires_at);
++CREATE INDEX IF NOT EXISTS gateway_traces_time ON gateway_traces USING brin(created_at);
++
++CREATE TABLE IF NOT EXISTS gateway_runtime (
++    id text PRIMARY KEY,
++    document jsonb NOT NULL,
++    updated_at timestamptz NOT NULL DEFAULT now()
++);
++INSERT INTO gateway_runtime(id,document) VALUES ('routing','{"mode":"auto"}')
++    ON CONFLICT DO NOTHING;
++
++CREATE TABLE IF NOT EXISTS gateway_capacity (
++    configuration text NOT NULL,
++    context_bucket bigint NOT NULL,
++    concurrency integer NOT NULL,
++    aggregate_tps double precision NOT NULL,
++    samples bigint NOT NULL,
++    updated_at timestamptz NOT NULL DEFAULT now(),
++    PRIMARY KEY(configuration, context_bucket, concurrency)
++);
+diff --git a/omlx/gateway/storage/trace_writer.py b/omlx/gateway/storage/trace_writer.py
+new file mode 100644
+index 0000000..31b6ab8
+--- /dev/null
++++ b/omlx/gateway/storage/trace_writer.py
+@@ -0,0 +1,123 @@
++"""Best-effort bounded JSONB log batches; financial writes never use this queue."""
++
++import asyncio
++import contextlib
++import json
++import logging
++import time
++from datetime import UTC, datetime, timedelta
++
++logger = logging.getLogger(__name__)
++
++
++def postgres_json(value):
++    # PostgreSQL JSONB rejects NUL and unpaired UTF-16 surrogates. Normalize
++    # those only in diagnostic logs so one hostile prompt cannot poison a batch.
++    if isinstance(value, str):
++        return (
++            value.replace("\x00", "\ufffd").encode("utf-8", errors="replace").decode()
++        )
++    if isinstance(value, dict):
++        return {postgres_json(k): postgres_json(v) for k, v in value.items()}
++    if isinstance(value, list):
++        return [postgres_json(v) for v in value]
++    return value
++
++
++class TraceWriter:
++    def __init__(
++        self,
++        store,
++        max_rows=100,
++        flush_seconds=1.0,
++        max_batch_bytes=4 * 1024 * 1024,
++        max_queue_bytes=32 * 1024 * 1024,
++    ):
++        self.store = store
++        self.max_rows = max_rows
++        self.flush_seconds = flush_seconds
++        self.max_batch_bytes = max_batch_bytes
++        self.max_queue_bytes = max_queue_bytes
++        self.queue = asyncio.Queue(maxsize=1000)
++        self.queued_bytes = 0
++        self.written = 0
++        self.dropped = 0
++        self.failed_batches = 0
++        self.task = None
++        self.closed = False
++
++    def start(self):
++        self.task = asyncio.create_task(self._run())
++
++    def submit(self, request_id, document, ttl_days):
++        payload = json.dumps(
++            postgres_json(document), separators=(",", ":"), allow_nan=False
++        )
++        size = len(payload.encode())
++        if (
++            self.closed
++            or self.queue.full()
++            or self.queued_bytes + size > self.max_queue_bytes
++        ):
++            self.dropped += 1
++            logger.warning("Gateway trace queue full: dropped=%s", self.dropped)
++            return False
++        now = datetime.now(UTC)
++        row = (request_id, now, now + timedelta(days=ttl_days), payload)
++        self.queue.put_nowait((row, size))
++        self.queued_bytes += size
++        return True
++
++    async def _run(self):
++        while not self.closed or not self.queue.empty():
++            try:
++                first = await asyncio.wait_for(self.queue.get(), self.flush_seconds)
++            except TimeoutError:
++                continue
++            batch = [first]
++            batch_bytes = first[1]
++            deadline = time.monotonic() + self.flush_seconds
++            while len(batch) < self.max_rows and batch_bytes < self.max_batch_bytes:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    break
++                try:
++                    if self.closed:
++                        entry = self.queue.get_nowait()
++                    else:
++                        entry = await asyncio.wait_for(self.queue.get(), remaining)
++                except (TimeoutError, asyncio.QueueEmpty):
++                    break
++                batch.append(entry)
++                batch_bytes += entry[1]
++            try:
++                for attempt in range(3):
++                    try:
++                        await self.store.write_traces([row for row, _ in batch])
++                        self.written += len(batch)
++                        break
++                    except Exception:
++                        self.failed_batches += 1
++                        if attempt == 2:
++                            self.dropped += len(batch)
++                            logger.error(
++                                "Gateway trace batch dropped: rows=%s total_dropped=%s",
++                                len(batch),
++                                self.dropped,
++                            )
++                        else:
++                            await asyncio.sleep(0.1 * 2**attempt)
++            finally:
++                self.queued_bytes -= batch_bytes
++                for _ in batch:
++                    self.queue.task_done()
++
++    async def close(self):
++        self.closed = True
++        if self.task:
++            try:
++                await asyncio.wait_for(self.task, 20)
++            except TimeoutError:
++                logger.error("Gateway trace flush timed out; pending logs may be lost")
++                with contextlib.suppress(asyncio.CancelledError):
++                    await self.task
+diff --git a/omlx/gateway/usage.py b/omlx/gateway/usage.py
+new file mode 100644
+index 0000000..cb8ea02
+--- /dev/null
++++ b/omlx/gateway/usage.py
+@@ -0,0 +1,106 @@
++"""Bounded SSE/JSON accounting with opt-in namespaced usage extensions."""
++
++import json
++import re
++from decimal import Decimal
++
++
++def encode_json(value):
++    return json.dumps(
++        value,
++        separators=(",", ":"),
++        allow_nan=False,
++        default=lambda x: float(x) if isinstance(x, Decimal) else str(x),
++    ).encode()
++
++
++class UsageObserver:
++    def __init__(
++        self,
++        alias,
++        extension=None,
++        max_frame_bytes=4 * 1024 * 1024,
++        include_stream_usage=True,
++    ):
++        self.alias = alias
++        self.extension = extension
++        self.max_frame_bytes = max_frame_bytes
++        self.buffer = b""
++        self.usage = {}
++        self.provider_id = None
++        self.failed = False
++        self.completed = False
++        self.include_stream_usage = include_stream_usage
++
++    def document(self, document):
++        if not isinstance(document, dict):
++            return document
++        self.failed |= bool(document.get("error")) or document.get("type") in (
++            "error",
++            "response.failed",
++        )
++        root = document.get("response")
++        if not isinstance(root, dict):
++            root = document
++        if isinstance(root.get("id"), str):
++            self.provider_id = root["id"]
++        if "model" in root:
++            root["model"] = self.alias
++        usage = root.get("usage")
++        if isinstance(usage, dict):
++            # Copy before extension so private caller fields cannot poison ledger.
++            self.usage.update({k: v for k, v in usage.items() if k != "x_gateway"})
++            if self.extension:
++                usage["x_gateway"] = self.extension(self.usage)
++        if document.get("type") in ("response.completed", "response.incomplete"):
++            self.completed = True
++        return document
++
++    def feed(self, data, final=False):
++        self.buffer += data
++        output = bytearray()
++        while match := re.search(rb"\r?\n\r?\n", self.buffer):
++            frame, self.buffer = (
++                self.buffer[: match.start()],
++                self.buffer[match.end() :],
++            )
++            if len(frame) > self.max_frame_bytes:
++                raise ValueError("provider SSE frame too large")
++            lines = frame.splitlines()
++            payload = b"\n".join(
++                line[5:].lstrip(b" ") for line in lines if line.startswith(b"data:")
++            )
++            if payload == b"[DONE]":
++                self.completed = True
++            elif payload:
++                try:
++                    value = self.document(json.loads(payload))
++                    if (
++                        not self.include_stream_usage
++                        and isinstance(value, dict)
++                        and "usage" in value
++                    ):
++                        value.pop("usage", None)
++                        if value.get("choices") == []:
++                            continue
++                    lines = [line for line in lines if not line.startswith(b"data:")]
++                    lines.append(b"data: " + encode_json(value))
++                except (json.JSONDecodeError, UnicodeDecodeError):
++                    self.failed = True
++            output.extend(b"\n".join(lines) + b"\n\n")
++        if len(self.buffer) > self.max_frame_bytes:
++            raise ValueError("provider SSE frame too large")
++        if final and self.buffer.strip():
++            self.failed = True  # Truncated event; never count as clean completion.
++            self.buffer = b""
++        return bytes(output)
++
++    def total_tokens(self):
++        prompt = self.usage.get("prompt_tokens", self.usage.get("input_tokens"))
++        output = self.usage.get("completion_tokens", self.usage.get("output_tokens"))
++        if all(
++            isinstance(n, int) and not isinstance(n, bool) and n >= 0
++            for n in (prompt, output)
++        ):
++            return prompt + output
++        return None
+diff --git a/omlx/server.py b/omlx/server.py
+index 3624491..59d9a4b 100644
+--- a/omlx/server.py
++++ b/omlx/server.py
+@@ -329,6 +329,11 @@ async def verify_api_key(
+     Checks the provided Bearer token against the main API key and all sub keys.
+     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
+     """
++    if "omlx.gateway.authorized" in request.scope:
++        from .gateway.middleware import AUTHORIZED
++        if request.scope["omlx.gateway.authorized"] is AUTHORIZED:
++            return True
++
+     from .admin.auth import fingerprint_key, verify_any_api_key
+     from .utils.network import is_loopback_bind
+ 
+@@ -600,7 +605,8 @@ async def lifespan(app: FastAPI):
+     # Runs after the enforcer wiring above so the preload sees the final
+     # memory ceiling.
+     preload_task = None
+-    if _server_state.engine_pool is not None:
++    from .scheduling import local_inference_suspended
++    if _server_state.engine_pool is not None and not local_inference_suspended():
+         _server_state.pinned_preload_complete = False
+ 
+         async def _preload_pinned() -> None:
+@@ -610,6 +616,8 @@ async def lifespan(app: FastAPI):
+                 _server_state.pinned_preload_complete = True
+ 
+         preload_task = asyncio.create_task(_preload_pinned())
++    elif local_inference_suspended():
++        _server_state.pinned_preload_complete = True
+ 
+     # Start TTL-only checker if process memory enforcer is not running
+     # (enforcer already includes TTL checks in its polling loop)
+@@ -704,6 +712,10 @@ app = FastAPI(
+     lifespan=lifespan,
+ )
+ 
++if os.environ.get("OMLX_GATEWAY_CONFIG"):
++    from .gateway.middleware import GatewayMiddleware
++    app.add_middleware(GatewayMiddleware, config_path=os.environ["OMLX_GATEWAY_CONFIG"])
++
+ # Include MCP routes
+ from .api.mcp_routes import router as mcp_router
+ from .api.mcp_routes import set_mcp_manager_getter
+@@ -1329,6 +1341,9 @@ async def get_engine(
+     """
+     pool = get_engine_pool()
+ 
++    from .scheduling import request_control
++    controlled_request = request_control.get() is not None
++
+     # Default model only applies to LLM
+     if model_id is None:
+         if engine_type != EngineType.LLM:
+@@ -1379,6 +1394,7 @@ async def get_engine(
+         # Fallback to default model if enabled (LLM only)
+         if (
+             engine_type == EngineType.LLM
++            and not controlled_request
+             and _server_state.global_settings
+             and _server_state.global_settings.model.model_fallback
+             and _server_state.default_model
+@@ -1430,6 +1446,11 @@ async def get_engine(
+     # release it before raising so a rejected request never leaks an in_use
+     # count (which would pin the engine non-evictable forever).
+     try:
++        if controlled_request and not isinstance(engine, BatchedEngine):
++            raise HTTPException(
++                status_code=503,
++                detail="This engine does not yet support gateway token and context controls",
++            )
+         if engine_type == EngineType.EMBEDDING:
+             if not isinstance(engine, EmbeddingEngine):
+                 raise HTTPException(
+diff --git a/pyproject.toml b/pyproject.toml
+index cfcf225..5e6eb27 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -131,6 +131,10 @@ dependencies = [
+ ]
+ 
+ [project.optional-dependencies]
++gateway = [
++    "asyncpg>=0.29,<1",
++    "boto3>=1.34,<2",
++]
+ grammar = [
+     # Grammar-constrained decoding for structured output (requires torch ~2GB)
+     # Keep this native pair aligned with omlx/_torch_stub.py and the DMG
+@@ -248,6 +252,7 @@ Repository = "https://github.com/jundot/omlx"
+ 
+ [project.scripts]
+ omlx = "omlx.cli:main"
++omlx-gateway = "omlx.gateway.cli:main"
+ 
+ [tool.setuptools.dynamic]
+ version = {attr = "omlx._version.__version__"}
+@@ -257,6 +262,7 @@ where = ["."]
+ include = ["omlx*"]
+ 
+ [tool.setuptools.package-data]
++"omlx.gateway.storage" = ["schema.sql"]
+ "omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
+ "omlx.admin" = [
+     "templates/**/*.html",
+-- 
+2.51.1
+

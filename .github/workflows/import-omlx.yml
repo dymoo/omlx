@@ -38,6 +38,7 @@ jobs:
           set -euo pipefail
           patch_dir="$(mktemp -d)"
           cp .bootstrap/*.patch "$patch_dir/"
+          cp .github/workflows/import-omlx.yml "$patch_dir/import-omlx.yml"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git remote add upstream https://github.com/jundot/omlx.git
@@ -47,12 +48,17 @@ jobs:
           git switch -c gateway/control-plane "$base"
           git am "$patch_dir/"*.patch
           git merge -s ours --allow-unrelated-histories origin/master -m 'Preserve repository initialization alongside upstream history'
+          git rm -r .github/workflows
+          mkdir -p .github/workflows
+          cp "$patch_dir/import-omlx.yml" .github/workflows/import-omlx.yml
+          git add .github/workflows/import-omlx.yml
+          git commit -m 'Leave inherited automation disabled during downstream initialization'
       - name: Install control-plane test dependencies
         run: pip install fastapi httpx asyncpg pytest pytest-asyncio ruff
       - name: Validate control plane and real PostgreSQL transactions
         run: |
           python -m ruff check omlx/gateway omlx/scheduling.py tests/gateway
           python -m pytest tests/gateway --confcutdir=tests/gateway -q
-      - name: Publish implementation and upstream baseline without force
+      - name: Publish implementation without force
         run: |
-          git push --atomic origin 14194fe74bab38b89c144bd89656fbedca641d14:refs/heads/upstream-main HEAD:refs/heads/gateway/control-plane HEAD:refs/heads/master
+          git push origin HEAD:refs/heads/master

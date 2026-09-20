@@ -29,3 +29,5 @@ jobs:
       - run: pip install fastapi httpx asyncpg pytest pytest-asyncio ruff
       - run: python -m ruff check omlx/gateway omlx/scheduling.py tests/gateway
       - run: python -m pytest tests/gateway --confcutdir=tests/gateway -q
+      - run: python -m ruff check benchmarks/ane_offload
+      - run: python -m unittest discover -s benchmarks/ane_offload/tests -v
